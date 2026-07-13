@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<title>Avstämning – Fakturor & Betalningar</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="page">
+
+<header class="top">
+  <h1>Avstämning — fakturor &amp; betalningar</h1>
+  <div class="sub">Offline verktyg. Ingen data lämnar webbläsaren. Använd Exportera/Importera för att spara ditt arbete mellan sessioner.</div>
+</header>
+
+<div class="toolbar" style="margin-bottom:22px;">
+  <button class="ghost" id="export-state">Exportera state (.json)</button>
+  <button class="ghost" id="import-state-btn">Importera state</button>
+  <input type="file" id="import-state" accept=".json" style="display:none;">
+</div>
+
+<div class="grid2">
+  <section>
+    <h2>1. Underlag (avgifter)</h2>
+    <div class="drop" id="drop-underlag">
+      <strong>Släpp en eller flera underlags-CSV:er här</strong>
+      Kolumnerna Beräkningsmånad, Namn, Fakturamottagare och Avgift används (övriga kolumner i filen ignoreras).
+      <input type="file" id="file-underlag" accept=".csv" multiple>
+    </div>
+    <div class="status-line" id="status-underlag">Inga filer inlästa.</div>
+    <ul class="file-list" id="filelist-underlag"></ul>
+  </section>
+
+  <section>
+    <h2>2. Kundreskontralista</h2>
+    <div class="drop" id="drop-reskontra">
+      <strong>Släpp en eller flera reskontra-CSV:er här</strong>
+      Kundreskontralista, grupperad per kund med fakturor och betalningar.
+      <input type="file" id="file-reskontra" accept=".csv" multiple>
+    </div>
+    <div class="status-line" id="status-reskontra">Inga filer inlästa.</div>
+    <ul class="file-list" id="filelist-reskontra"></ul>
+  </section>
+</div>
+
+<section>
+  <h2>3. Manuella rader (underlag)</h2>
+  <div class="manual-form">
+    <div><label>Beräkningsmånad</label><input type="text" id="m-manad" placeholder="2026-03"></div>
+    <div><label>Namn</label><input type="text" id="m-namn"></div>
+    <div><label>Fakturamottagare</label><input type="text" id="m-mottagare"></div>
+    <div><label>Avgift</label><input type="number" id="m-avgift" step="0.01"></div>
+  </div>
+  <button id="add-manual">+ Lägg till rad</button>
+  <button class="ghost" id="clear-manual-form">Rensa fält</button>
+
+  <details class="section-details">
+    <summary>Födelseår &amp; åldersfärgkodning</summary>
+    <div class="small" style="margin:8px 0 6px;">Födelseår fylls i automatiskt från Personnummer-kolumnen i underlaget (bara året sparas, inte personnumret) och används för att färgkoda raderna efter ålder det år avgiften avser. Går att justera manuellt vid behov:</div>
+    <div class="legend-row">
+      <span class="legend-dot age-red"></span> 1–2 år <span class="legend-dot age-orange"></span> 3 år <span class="legend-dot age-green"></span> 4+ år
+    </div>
+    <div style="overflow-x:auto;margin-bottom:16px;">
+      <table id="tbl-birthyears"><thead><tr><th>Namn</th><th>Födelseår</th></tr></thead><tbody></tbody></table>
+    </div>
+  </details>
+
+  <details class="section-details" id="underlag-details">
+    <summary>Underlagsrader (<span id="underlag-row-count">0</span>)</summary>
+    <div class="filter-bar">
+      <label>Filtrera på namn: <input type="text" id="underlag-name-filter" placeholder="skriv för att filtrera"></label>
+    </div>
+    <div style="overflow-x:auto;">
+      <table id="tbl-underlag"><thead><tr>
+        <th>Månad</th><th>Namn</th><th>Fakturamottagare</th>
+        <th class="num">Avgift</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2>4. Mappning — koppla Namn i underlag till kund i kundreskontralistan</h2>
+  <div class="small" style="margin-bottom:10px;">Flera underlags-namn kan mappas till samma kund (t.ex. flera barn → en fakturamottagare). En post kan även delas på flera kunder med valfri procentfördelning (t.ex. 50/50 vid delad vårdnad) via "+ dela på fler kunder". Namn där alla rader är markerade "ej fakturering" (avsnitt 5) visas inte här.</div>
+
+  <details class="section-details">
+    <summary>Lägg till kund manuellt (t.ex. ingen faktura ännu)</summary>
+    <div class="small" style="margin:8px 0 6px;">Kund saknas i listan? Lägg till den manuellt så går den att mappa och dyker upp i avstämningen med Fakturerat 0,00:</div>
+    <div class="manual-form" style="grid-template-columns:1fr 2fr auto;margin-bottom:10px;">
+      <div><label>Kundnr</label><input type="text" id="m-kundnr"></div>
+      <div><label>Kundnamn</label><input type="text" id="m-kundnamn"></div>
+      <div style="justify-content:flex-end;"><label>&nbsp;</label><button id="add-manual-kund">+ Lägg till kund</button></div>
+    </div>
+    <ul class="file-list" id="manual-kund-list" style="margin-bottom:16px;"></ul>
+  </details>
+
+  <div class="filter-bar">
+    <label><input type="checkbox" id="mapping-unmapped-only"> Visa endast omappade namn</label>
+  </div>
+  <div style="overflow-x:auto;">
+    <table id="tbl-mapping"><thead><tr>
+      <th>Namn (underlag)</th><th>Fakturamottagare (underlag)</th><th>Kund i kundreskontralistan</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section>
+  <h2>5. Ej fakturering (perioder)</h2>
+  <div class="small" style="margin-bottom:10px;">Markera perioder då en person inte ska faktureras, med kommentar. Lämna "Till" tomt om perioden fortfarande pågår. Flera perioder per person går bra.</div>
+  <details class="section-details" open>
+    <summary>Perioder per person</summary>
+    <div style="overflow-x:auto;">
+      <table id="tbl-exclusions"><thead><tr>
+        <th>Namn</th><th>Perioder</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2>6. Avstämning</h2>
+  <div class="toolbar">
+    <label class="small" style="display:flex;align-items:center;gap:6px;">
+      Fakturering sker
+      <input type="number" id="invoice-offset" value="1" min="-3" max="3" style="width:52px;">
+      månad(er) i förskott
+    </label>
+    <label class="small" style="display:flex;align-items:center;gap:6px;">
+      Räkna underlag från
+      <input type="text" id="start-underlag" placeholder="2026-01" style="width:90px;">
+    </label>
+    <label class="small" style="display:flex;align-items:center;gap:6px;">
+      Räkna kundreskontra från
+      <input type="text" id="start-reskontra" placeholder="2026-01-01" style="width:100px;">
+    </label>
+    <button id="run-match">Kör avstämning</button>
+  </div>
+  <div class="small" style="margin-bottom:12px;">Om Beräkningsmånad avser t.ex. mars men faktureras redan i februari, sätt förskott till 1. Startdatumen filtrerar bort underlagsrader/transaktioner tidigare än angiven period, lämna tomt för att ta med allt.</div>
+  <div class="filter-bar">
+    Visa:
+    <label><input type="checkbox" id="filter-deviations"> Endast kunder med U/F-avvikelse (ej godkänd)</label>
+    <label><input type="checkbox" id="filter-outstanding"> Endast kunder med utestående belopp</label>
+    <label><input type="checkbox" id="filter-hide-ok-months"> Dölj månader som stämmer</label>
+  </div>
+  <div id="report"></div>
+</section>
+
+</div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
