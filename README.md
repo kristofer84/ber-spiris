@@ -33,3 +33,7 @@ och besök `http://localhost:8000/`.
 ## Publicering
 
 Sidan publiceras automatiskt till GitHub Pages via GitHub Actions vid push till `main` (se `.github/workflows/pages.yml`).
+
+## Licens
+
+MIT, se [LICENSE](LICENSE).
