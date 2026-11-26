@@ -45,15 +45,26 @@
 
 <section>
   <h2>3. Manuella rader (underlag)</h2>
-  <div class="manual-form">
-    <div><label>Beräkningsmånad</label><input type="text" id="m-manad" placeholder="2026-03"></div>
+  <div class="small" style="margin-bottom:10px;">En manuell rad gäller en period (Från–Till, lämna Till tomt för pågående t.o.m. senaste månaden i underlaget) med ett belopp per månad. För de månaderna <strong>ersätter</strong> raden underlaget från filerna för samma namn — både när underlaget är fel och när det saknas. Raderna går att redigera direkt i tabellen nedan.</div>
+  <div class="manual-form" style="grid-template-columns:repeat(5,1fr);">
+    <div><label>Från (månad)</label><input type="text" id="m-from" placeholder="2026-03"></div>
+    <div><label>Till (månad)</label><input type="text" id="m-to" placeholder="pågående"></div>
     <div><label>Namn</label><input type="text" id="m-namn"></div>
     <div><label>Fakturamottagare</label><input type="text" id="m-mottagare"></div>
-    <div><label>Avgift</label><input type="number" id="m-avgift" step="0.01"></div>
+    <div><label>Avgift / mån</label><input type="number" id="m-avgift" step="0.01"></div>
   </div>
   <button id="add-manual">+ Lägg till rad</button>
   <button class="ghost" id="clear-manual-form">Rensa fält</button>
-  <button class="ghost" id="generate-underlag" title="Skapar manuella rader för kund+månader där det finns kundfakturor men inget underlag alls. Beloppet = fakturerat belopp.">Generera underlag för fakturor utan underlag</button>
+  <button class="ghost" id="generate-underlag" title="Skapar manuella rader för kund+månader där det finns kundfakturor men inget underlag alls. Beloppet = fakturerat belopp; månader i följd med samma belopp slås ihop till en period.">Generera underlag för fakturor utan underlag</button>
+
+  <details class="section-details" open>
+    <summary>Manuella rader (<span id="manual-row-count">0</span>)</summary>
+    <div style="overflow-x:auto;">
+      <table id="tbl-manual"><thead><tr>
+        <th>Från</th><th>Till</th><th>Namn</th><th>Fakturamottagare</th><th class="num">Avgift / mån</th><th>Månader</th><th>Kommentar</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </details>
 
   <details class="section-details">
     <summary>Födelseår &amp; åldersfärgkodning</summary>
@@ -106,8 +117,8 @@
 </section>
 
 <section>
-  <h2>5. Ej fakturering &amp; justerade belopp (perioder)</h2>
-  <div class="small" style="margin-bottom:10px;">Markera perioder då en person inte ska faktureras, med kommentar. Lämna "Till" tomt om perioden fortfarande pågår. Flera perioder per person går bra. Fyll i <strong>kr/mån</strong> för att i stället ersätta underlagets avgift med det beloppet varje månad i perioden (t.ex. när underlaget är fel) — tomt belopp betyder ej fakturering. Justeringen gäller månader som finns i underlaget; saknas en månad helt, lägg till den under avsnitt 3.</div>
+  <h2>5. Ej fakturering (perioder)</h2>
+  <div class="small" style="margin-bottom:10px;">Markera perioder då en person inte ska faktureras, med kommentar. Lämna "Till" tomt om perioden fortfarande pågår. Flera perioder per person går bra. Fel belopp i underlaget rättas med en manuell rad i avsnitt 3.</div>
   <details class="section-details" open>
     <summary>Perioder per person</summary>
     <div style="overflow-x:auto;">

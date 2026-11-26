@@ -232,10 +232,8 @@ wireDropMulti('drop-underlag','file-underlag', (text, name)=>{
     if(r.birthYear && !state.birthYears[r.namn]) state.birthYears[r.namn] = r.birthYear;
   });
   renderUnderlagFileList();
-  renderUnderlagTable();
-  renderBirthYearTable();
-  renderMappingTable();
-  renderExclusionsTable();
+  renderManualTable(); // öppna perioder beror på senaste månaden i filerna
+  refreshUnderlagDependents();
 });
 
 wireDropMulti('drop-reskontra','file-reskontra', (text, name)=>{
@@ -346,6 +344,7 @@ function renderUnderlagFileList(){
     btn.addEventListener('click', ()=>{
       state.underlagFiles.splice(parseInt(btn.dataset.idx),1);
       renderUnderlagFileList();
+      renderManualTable();
       renderUnderlagTable();
   renderBirthYearTable();
       renderMappingTable();
@@ -355,8 +354,83 @@ function renderUnderlagFileList(){
 }
 
 // ---------- underlag table (incl manual) ----------
+// Manuella rader har en period (from–to, 'YYYY-MM'; tomt to = t.o.m. senaste månaden i underlagsfilerna)
+// och ett belopp per månad. För varje namn+månad som en manuell rad täcker ERSÄTTER den underlaget
+// från filerna (används både när underlaget är fel och när det saknas).
+function fileUnderlagRows(){
+  return state.underlagFiles.flatMap(f=>f.rows);
+}
+function monthRange(fromKey, toKey){
+  const out = [];
+  let m = fromKey;
+  for(let guard=0; m && m <= toKey && guard < 600; guard++){ out.push(m); m = shiftMonthKey(m, 1); }
+  return out;
+}
+function latestFileUnderlagMonth(){
+  let max = '';
+  fileUnderlagRows().forEach(r=>{ const mk = monthKeyFromUnderlag(r.manad); if(/^\d{4}-\d{2}$/.test(mk) && mk > max) max = mk; });
+  return max;
+}
+function manualRowMonths(m, latest = latestFileUnderlagMonth()){
+  const from = monthKeyFromUnderlag(m.from);
+  if(!/^\d{4}-\d{2}$/.test(from)) return [];
+  let to = m.to ? monthKeyFromUnderlag(m.to) : latest;
+  if(!/^\d{4}-\d{2}$/.test(to) || to < from) to = from;
+  return monthRange(from, to);
+}
+// en underlagsrad per månad för varje manuell rad
+function expandedManualRows(){
+  const latest = latestFileUnderlagMonth();
+  return state.manual.flatMap((m, i)=>manualRowMonths(m, latest).map(mk=>({
+    id: `manual-${i}-${mk}`, manad: mk, namn: m.namn || '', mottagare: m.mottagare || '',
+    avgift: Number(m.avgift) || 0, manual: true, manualIdx: i, note: m.note || ''
+  })));
+}
+// effektivt underlag: filrader som inte täcks av en manuell rad + manuella rader utvecklade per månad
 function allUnderlagRows(){
-  return state.underlagFiles.flatMap(f=>f.rows).concat(state.manual);
+  const manual = expandedManualRows();
+  const covered = new Set(manual.map(r=>`${r.namn}|${r.manad}`));
+  return fileUnderlagRows()
+    .filter(r=>!covered.has(`${r.namn}|${monthKeyFromUnderlag(r.manad)}`))
+    .concat(manual);
+}
+// namn+månader där manuella rader ersatt befintligt filunderlag: original vs nytt belopp
+function underlagReplacements(){
+  const manual = expandedManualRows();
+  const byKey = new Map();
+  manual.forEach(r=>{
+    const key = `${r.namn}|${r.manad}`;
+    const rec = byKey.get(key) || {namn:r.namn, mk:r.manad, original:0, nytt:0, note:r.note, hasFile:false};
+    rec.nytt += r.avgift;
+    byKey.set(key, rec);
+  });
+  fileUnderlagRows().forEach(r=>{
+    const rec = byKey.get(`${r.namn}|${monthKeyFromUnderlag(r.manad)}`);
+    if(rec){ rec.original += r.avgift; rec.hasFile = true; }
+  });
+  return [...byKey.values()].filter(r=>r.hasFile);
+}
+// äldre state: manuella rader med en enda 'manad', och perioder i avsnitt 5 med 'avgift'
+// (justerat belopp) — flytta båda till manuella periodrader
+function migrateUnderlagState(){
+  state.manual = (state.manual || []).map(m=>{
+    if(m.from === undefined && m.manad !== undefined){
+      const mk = monthKeyFromUnderlag(m.manad);
+      const {manad, id, ...rest} = m;
+      return {...rest, from: mk, to: mk};
+    }
+    return m;
+  });
+  Object.entries(state.exclusions || {}).forEach(([namn, periods])=>{
+    const keep = [];
+    (periods || []).forEach(p=>{
+      if(p.avgift === undefined || p.avgift === null || String(p.avgift).trim() === ''){ keep.push(p); return; }
+      const mottagare = (fileUnderlagRows().find(r=>r.namn===namn) || {}).mottagare || '';
+      state.manual.push({from: monthKeyFromUnderlag(p.from), to: p.to ? monthKeyFromUnderlag(p.to) : '',
+        namn, mottagare, avgift: Number(p.avgift) || 0, note: p.comment || ''});
+    });
+    state.exclusions[namn] = keep;
+  });
 }
 // beräknar "fyllda år" det kalenderår raden avser, och returnerar CSS-klass för färgkodning:
 // 1-2 år = röd, 3 år = orange, 4+ år = grön. Saknas födelseår ges ingen färg.
@@ -399,8 +473,11 @@ function renderBirthYearTable(){
 function renderUnderlagTable(){
   const tbody = document.querySelector('#tbl-underlag tbody');
   tbody.innerHTML = '';
-  const rows = allUnderlagRows();
-  const nonManualCount = rows.length - state.manual.length;
+  const manualRows = expandedManualRows();
+  const covered = new Set(manualRows.map(r=>`${r.namn}|${r.manad}`));
+  const rows = fileUnderlagRows()
+    .map(r=>({...r, replaced: covered.has(`${r.namn}|${monthKeyFromUnderlag(r.manad)}`)}))
+    .concat(manualRows);
   document.getElementById('underlag-row-count').textContent = rows.length;
   if(rows.length===0){
     tbody.innerHTML = '<tr><td colspan="5" class="empty">Inga rader ännu.</td></tr>';
@@ -408,48 +485,92 @@ function renderUnderlagTable(){
   }
   const nameFilter = (document.getElementById('underlag-name-filter').value || '').toLowerCase().trim();
   let visibleCount = 0;
-  rows.forEach((r, idx)=>{
+  rows.forEach(r=>{
     if(nameFilter && !(r.namn||'').toLowerCase().includes(nameFilter)) return;
     visibleCount++;
-    const isManual = idx >= nonManualCount;
-    const manualIdx = idx - nonManualCount;
     const tr = document.createElement('tr');
     const ageClass = ageClassForRow(r.namn, r.manad);
     if(ageClass) tr.classList.add(ageClass);
-    tr.innerHTML = `<td>${esc(monthKeyFromUnderlag(r.manad))}</td><td>${esc(r.namn)}${r.generated ? ` <span class="tag cross" title="${esc(r.note)}">genererad</span>` : ''}</td>
-      <td>${esc(r.mottagare)}</td><td class="num">${fmtNum(r.avgift)}</td>
-      <td>${isManual ? `<button class="pill-btn" data-del="${manualIdx}">✕</button>` : ''}</td>`;
+    if(r.replaced) tr.classList.add('excluded-row');
+    const tag = r.manual ? ` <span class="tag cross" title="${esc(r.note)}">manuell</span>`
+      : (r.replaced ? ' <span class="tag unmapped">ersatt av manuell rad</span>' : '');
+    tr.innerHTML = `<td>${esc(monthKeyFromUnderlag(r.manad))}</td><td>${esc(r.namn)}${tag}</td>
+      <td>${esc(r.mottagare)}</td><td class="num">${fmtNum(r.avgift)}</td><td></td>`;
     tbody.appendChild(tr);
   });
   if(visibleCount===0){
     tbody.innerHTML = '<tr><td colspan="5" class="empty">Inga rader matchar filtret.</td></tr>';
   }
-  tbody.querySelectorAll('[data-del]').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      state.manual.splice(parseInt(btn.dataset.del),1);
-      renderUnderlagTable();
+}
+// allt som beror på underlaget (namnlistor m.m.) — körs när manuella rader ändras
+function refreshUnderlagDependents(){
+  renderUnderlagTable();
   renderBirthYearTable();
-      renderMappingTable();
+  renderMappingTable();
   renderExclusionsTable();
+}
+// redigerbar tabell över manuella periodrader
+function renderManualTable(){
+  const tbody = document.querySelector('#tbl-manual tbody');
+  tbody.innerHTML = '';
+  document.getElementById('manual-row-count').textContent = state.manual.length;
+  if(state.manual.length===0){
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">Inga manuella rader.</td></tr>';
+    return;
+  }
+  const latest = latestFileUnderlagMonth();
+  state.manual.forEach((m, i)=>{
+    const n = manualRowMonths(m, latest).length;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" class="mr-in mr-month" data-f="from" value="${esc(m.from)}" placeholder="2026-03"></td>
+      <td><input type="text" class="mr-in mr-month" data-f="to" value="${esc(m.to)}" placeholder="pågående"></td>
+      <td><input type="text" class="mr-in" data-f="namn" value="${esc(m.namn)}"></td>
+      <td><input type="text" class="mr-in" data-f="mottagare" value="${esc(m.mottagare)}"></td>
+      <td><input type="number" class="mr-in mr-num" data-f="avgift" step="0.01" value="${esc(m.avgift)}"></td>
+      <td class="small mr-count">${n ? `${n} mån` : '<span class="tag warn">ogiltig period</span>'}</td>
+      <td><input type="text" class="mr-in" data-f="note" value="${esc(m.note)}" placeholder="kommentar"></td>
+      <td><button class="pill-btn" title="Ta bort">✕</button></td>`;
+    tr.querySelectorAll('.mr-in').forEach(inp=>{
+      inp.addEventListener('change', ()=>{
+        const f = inp.dataset.f;
+        let v = inp.value;
+        if(f==='avgift') v = parseSwedishNumber(v);
+        else if(f==='from' || f==='to') v = v.trim() ? monthKeyFromUnderlag(v.trim()) : '';
+        else if(f==='namn') v = v.trim();
+        m[f] = v;
+        if(f==='from' || f==='to') inp.value = v;
+        const cnt = manualRowMonths(m).length;
+        tr.querySelector('.mr-count').innerHTML = cnt ? `${cnt} mån` : '<span class="tag warn">ogiltig period</span>';
+        refreshUnderlagDependents();
+      });
     });
+    tr.querySelector('.pill-btn').addEventListener('click', ()=>{
+      state.manual.splice(i, 1);
+      renderManualTable();
+      refreshUnderlagDependents();
+    });
+    tbody.appendChild(tr);
   });
 }
 document.getElementById('underlag-name-filter').addEventListener('input', renderUnderlagTable);
 
 document.getElementById('add-manual').addEventListener('click', ()=>{
+  const fromRaw = document.getElementById('m-from').value.trim();
+  const toRaw = document.getElementById('m-to').value.trim();
   const row = {
-    id: nextRowId(),
-    manad: document.getElementById('m-manad').value,
-    namn: document.getElementById('m-namn').value,
+    from: fromRaw ? monthKeyFromUnderlag(fromRaw) : '',
+    to: toRaw ? monthKeyFromUnderlag(toRaw) : '',
+    namn: document.getElementById('m-namn').value.trim(),
     mottagare: document.getElementById('m-mottagare').value,
-    avgift: parseFloat(document.getElementById('m-avgift').value)||0
+    avgift: parseSwedishNumber(document.getElementById('m-avgift').value),
+    note: ''
   };
   if(!row.namn){ alert('Namn krävs.'); return; }
+  if(!/^\d{4}-\d{2}$/.test(row.from)){ alert('Från-månad krävs, t.ex. 2026-03.'); return; }
   state.manual.push(row);
-  renderUnderlagTable();
-  renderBirthYearTable();
-  renderMappingTable();
-  renderExclusionsTable();
+  renderManualTable();
+  refreshUnderlagDependents();
 });
 
 // Skapar manuella underlagsrader för kund+månader där det finns kundfakturor men inget underlag.
@@ -470,7 +591,7 @@ document.getElementById('generate-underlag').addEventListener('click', ()=>{
       namesByKund.get(e.kundNr).push({namn, entries});
     });
   });
-  const toCreate = [], skipped = [], newMappings = {};
+  const perMonth = [], toCreate = [], skipped = [], newMappings = {};
   missing.forEach(m=>{
     const mapped = namesByKund.get(m.kundNr) || [];
     let namn = null;
@@ -486,27 +607,37 @@ document.getElementById('generate-underlag').addEventListener('click', ()=>{
       skipped.push(`${m.kundNr} ${m.kundNamn} ${m.mk} (${mapped.length ? mapped.map(x=>x.namn).join(' / ') + ' — delad eller flera namn' : 'namnet är mappat till annan kund'})`);
       return;
     }
-    toCreate.push({id: nextRowId(), manad: m.serviceMk, namn, mottagare: m.kundNamn, avgift: m.belopp,
-      generated: true, note: `Genererad från faktura ${m.fakturanr.join(', ')}`});
+    perMonth.push({serviceMk: m.serviceMk, namn, mottagare: m.kundNamn, avgift: Math.round(m.belopp*100)/100, fakturanr: m.fakturanr});
   });
-  const total = toCreate.reduce((s,r)=>s+r.avgift, 0);
-  let msg = `Skapa ${toCreate.length} manuella underlagsrad(er), totalt ${fmtNum(total)} kr?\n\n` +
-    toCreate.slice(0,15).map(r=>`${r.manad}  ${r.namn}  ${fmtNum(r.avgift)}`).join('\n') +
+  // slå ihop månader i följd med samma namn, mottagare och belopp till en periodrad
+  perMonth.sort((a,b)=>a.namn.localeCompare(b.namn,'sv') || a.serviceMk.localeCompare(b.serviceMk));
+  perMonth.forEach(m=>{
+    const last = toCreate[toCreate.length-1];
+    if(last && last.namn===m.namn && last.mottagare===m.mottagare && Math.abs(last.avgift-m.avgift)<0.005
+       && shiftMonthKey(last.to, 1)===m.serviceMk){
+      last.to = m.serviceMk; last._fakturanr.push(...m.fakturanr); last._months++;
+      return;
+    }
+    toCreate.push({from: m.serviceMk, to: m.serviceMk, namn: m.namn, mottagare: m.mottagare, avgift: m.avgift,
+      generated: true, _fakturanr: [...m.fakturanr], _months: 1});
+  });
+  toCreate.forEach(r=>{ r.note = `Genererad från faktura ${r._fakturanr.join(', ')}`; });
+  const total = toCreate.reduce((s,r)=>s + r.avgift*r._months, 0);
+  let msg = `Skapa ${toCreate.length} manuella underlagsrad(er) (${perMonth.length} månader), totalt ${fmtNum(total)} kr?\n\n` +
+    toCreate.slice(0,15).map(r=>`${r.from===r.to ? r.from : r.from+' – '+r.to}  ${r.namn}  ${fmtNum(r.avgift)}/mån`).join('\n') +
     (toCreate.length>15 ? `\n… och ${toCreate.length-15} till` : '');
   if(skipped.length) msg += `\n\nHoppas över (${skipped.length}), lägg till manuellt:\n` + skipped.slice(0,10).join('\n') + (skipped.length>10 ? '\n…' : '');
   if(!toCreate.length){ alert(msg.replace(/^Skapa 0[^\n]*\n\n/, 'Inga rader kunde skapas automatiskt.\n\n')); return; }
   if(!confirm(msg)) return;
   Object.entries(newMappings).forEach(([namn, kundNr])=>{ state.mapping[namn] = [{kundNr, percent:100}]; });
-  state.manual.push(...toCreate);
-  renderUnderlagTable();
-  renderBirthYearTable();
-  renderMappingTable();
-  renderExclusionsTable();
+  state.manual.push(...toCreate.map(({_fakturanr, _months, ...r})=>r));
+  renderManualTable();
+  refreshUnderlagDependents();
   runMatch();
 });
 
 document.getElementById('clear-manual-form').addEventListener('click', ()=>{
-  ['m-manad','m-namn','m-mottagare','m-avgift'].forEach(id=>document.getElementById(id).value='');
+  ['m-from','m-to','m-namn','m-mottagare','m-avgift'].forEach(id=>document.getElementById(id).value='');
 });
 
 // ---------- mapping table ----------
@@ -575,8 +706,7 @@ function renderMappingTable(){
     if(!byNamn.has(r.namn)) byNamn.set(r.namn, {mottagare: new Set(), anyActive: false});
     const entry = byNamn.get(r.namn);
     entry.mottagare.add(r.mottagare);
-    const p = findExclusionForRow(r);
-    if(!p || isOverridePeriod(p)) entry.anyActive = true; // justerat belopp ska fortfarande mappas
+    if(!findExclusionForRow(r)) entry.anyActive = true;
   });
   // hide names whose every row falls within an "ej fakturering"-period — nothing to map
   [...byNamn.keys()].forEach(namn=>{
@@ -660,12 +790,7 @@ function renderMappingTable(){
 }
 document.getElementById('mapping-unmapped-only').addEventListener('change', renderMappingTable);
 
-// ---------- perioder: ej fakturering ELLER justerat belopp ----------
-// En period med tomt belopp = ej fakturering (raderna utesluts). Med belopp = underlagets avgift
-// ersätts med det beloppet per månad i perioden (t.ex. när underlaget är fel).
-function isOverridePeriod(p){
-  return p && p.avgift !== undefined && p.avgift !== null && String(p.avgift).trim() !== '';
-}
+// ---------- exclusion periods (ej fakturering) ----------
 function getExclusionPeriods(namn){
   if(!state.exclusions[namn]) state.exclusions[namn] = [];
   return state.exclusions[namn];
@@ -686,9 +811,7 @@ function renderExclusionsTable(){
         <input type="text" class="period-month period-from" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.from)}" placeholder="2026-03">
         <span class="period-arrow">till</span>
         <input type="text" class="period-month period-to" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.to)}" placeholder="pågående">
-        <input type="number" class="period-avgift" step="0.01" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.avgift)}" placeholder="ej fakt." title="Belopp per månad som ersätter underlaget. Tomt = ej fakturering.">
-        <span class="period-arrow">kr/mån</span>
-        <input type="text" class="period-comment" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.comment)}" placeholder="kommentar, t.ex. flyttat / fel i underlag">
+        <input type="text" class="period-comment" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.comment)}" placeholder="kommentar, t.ex. flyttat">
         <button class="pill-btn" data-removeperiod="${esc(namn)}|${i}" title="Ta bort period">✕</button>
       </div>`).join('');
     rowsHtml += `<button class="period-add" data-addperiod="${esc(namn)}">+ lägg till period</button>`;
@@ -700,12 +823,6 @@ function renderExclusionsTable(){
     });
     tr.querySelectorAll('.period-to').forEach((inp,i)=>{
       inp.addEventListener('change', ()=>{ periods[i].to = inp.value.trim(); });
-    });
-    tr.querySelectorAll('.period-avgift').forEach((inp,i)=>{
-      inp.addEventListener('change', ()=>{
-        const v = inp.value.trim();
-        if(v==='') delete periods[i].avgift; else periods[i].avgift = parseSwedishNumber(v);
-      });
     });
     tr.querySelectorAll('.period-comment').forEach((inp,i)=>{
       inp.addEventListener('change', ()=>{ periods[i].comment = inp.value; });
@@ -764,27 +881,15 @@ function runMatch(){
 
   const allRows = allUnderlagRows();
   const excludedRows = [];
-  // justerade belopp: per namn+månad ersätts underlagets SUMMA med periodens belopp (en rad behålls
-  // med nytt belopp, ev. övriga rader samma månad tas bort) — oavsett hur många rader underlaget har
-  const overrides = new Map(); // `${namn}|${mk}` -> {namn, mk, original, nytt, comment}
   let skippedUnderlagCount = 0;
-  const rows = [];
-  allRows.forEach(r=>{
-    const rowMk = monthKeyFromUnderlag(r.manad);
-    if(startUnderlagKey && rowMk < startUnderlagKey){ skippedUnderlagCount++; return; }
+  const rows = allRows.filter(r=>{
+    if(startUnderlagKey && monthKeyFromUnderlag(r.manad) < startUnderlagKey){ skippedUnderlagCount++; return false; }
     const period = findExclusionForRow(r);
-    if(period && isOverridePeriod(period)){
-      const key = `${r.namn}|${rowMk}`;
-      const rec = overrides.get(key);
-      if(rec){ rec.original += r.avgift; return; }
-      const nytt = Number(period.avgift) || 0;
-      overrides.set(key, {namn:r.namn, mk:rowMk, original:r.avgift, nytt, comment:period.comment});
-      rows.push({...r, avgift:nytt});
-      return;
-    }
-    if(period){ excludedRows.push({...r, comment: period.comment, periodFrom: period.from, periodTo: period.to}); return; }
-    rows.push(r);
+    if(period){ excludedRows.push({...r, comment: period.comment, periodFrom: period.from, periodTo: period.to}); return false; }
+    return true;
   });
+  // manuella rader som ersatt befintligt filunderlag (visas i rapporten), inom startdatum
+  const replacements = underlagReplacements().filter(o=>!(startUnderlagKey && o.mk < startUnderlagKey));
   const reportEl = document.getElementById('report');
   if(allRows.length===0 || allReskontraRows().length===0){
     reportEl.innerHTML = '<div class="empty">Läs in underlag och kundreskontralista, och mappa minst en person, innan avstämning körs.</div>';
@@ -804,8 +909,7 @@ function runMatch(){
     });
   });
   const isExcludedKundMonth = (kundNr, serviceMk)=>(namesByKundNr.get(kundNr) || []).some(namn=>{
-    const p = findExclusionForRow({namn, manad: serviceMk});
-    return p && !isOverridePeriod(p);
+    return !!findExclusionForRow({namn, manad: serviceMk});
   });
   const unmapped = [];
   rows.forEach(r=>{
@@ -1153,23 +1257,23 @@ function runMatch(){
     html += `<div class="small" style="margin-top:6px;"><span class="tag unmapped">Ej mappade</span> ${esc(names.join(', '))} — gå till avsnitt 4 för att koppla dessa.</div>`;
   }
 
-  if(overrides.size){
+  if(replacements.length){
     const byNamn = new Map();
-    overrides.forEach(o=>{
+    replacements.forEach(o=>{
       if(!byNamn.has(o.namn)) byNamn.set(o.namn, []);
       byNamn.get(o.namn).push(o);
     });
-    html += `<div class="excl-group-wrap"><h3 class="excl-group-title">Justerade underlag (belopp ersatt via period i avsnitt 5)</h3>`;
+    html += `<div class="excl-group-wrap"><h3 class="excl-group-title">Ersatt underlag (manuella rader i avsnitt 3)</h3>`;
     [...byNamn.entries()].sort((a,b)=>a[0].localeCompare(b[0],'sv')).forEach(([namn, list])=>{
       const diff = list.reduce((s,o)=>s + o.nytt - o.original, 0);
       html += `<details class="excl-group"><summary>
           <span class="excl-namn">${esc(namn)}</span>
           <span class="excl-meta">${list.length} månad(er) · justering ${diff>0?'+':''}${fmtNum(diff)} kr</span>
         </summary>
-        <table><thead><tr><th>Månad</th><th class="num">Underlag</th><th class="num">Justerat</th><th class="num">Skillnad</th><th>Kommentar</th></tr></thead><tbody>`;
+        <table><thead><tr><th>Månad</th><th class="num">Underlag (fil)</th><th class="num">Manuellt</th><th class="num">Skillnad</th><th>Kommentar</th></tr></thead><tbody>`;
       list.sort((a,b)=>a.mk.localeCompare(b.mk)).forEach(o=>{
         html += `<tr><td>${esc(o.mk)}</td><td class="num">${fmtNum(o.original)}</td><td class="num">${fmtNum(o.nytt)}</td>
-          <td class="num">${fmtNum(o.nytt - o.original)}</td><td>${esc(o.comment)}</td></tr>`;
+          <td class="num">${fmtNum(o.nytt - o.original)}</td><td>${esc(o.note)}</td></tr>`;
       });
       html += `</tbody></table></details>`;
     });
@@ -1258,6 +1362,7 @@ document.getElementById('import-state').addEventListener('change', e=>{
       state.excludedReskontraRows = loaded.excludedReskontraRows || {};
       state.mapping = loaded.mapping || {};
       state.exclusions = loaded.exclusions || {};
+      migrateUnderlagState();
       state.approvedDiffs = loaded.approvedDiffs || {};
       state.invoiceOffset = (loaded.invoiceOffset !== undefined) ? loaded.invoiceOffset : 1;
       state.startUnderlag = loaded.startUnderlag || '';
@@ -1268,6 +1373,7 @@ document.getElementById('import-state').addEventListener('change', e=>{
       renderUnderlagFileList();
       renderReskontraFileList();
       renderManualKundList();
+      renderManualTable();
       renderUnderlagTable();
   renderBirthYearTable();
       renderMappingTable();
@@ -1283,6 +1389,7 @@ document.getElementById('import-state').addEventListener('change', e=>{
 renderUnderlagFileList();
 renderReskontraFileList();
 renderManualKundList();
+renderManualTable();
 renderUnderlagTable();
   renderBirthYearTable();
 renderMappingTable();
