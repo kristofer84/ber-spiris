@@ -53,6 +53,7 @@
   </div>
   <button id="add-manual">+ Lägg till rad</button>
   <button class="ghost" id="clear-manual-form">Rensa fält</button>
+  <button class="ghost" id="generate-underlag" title="Skapar manuella rader för kund+månader där det finns kundfakturor men inget underlag alls. Beloppet = fakturerat belopp.">Generera underlag för fakturor utan underlag</button>
 
   <details class="section-details">
     <summary>Födelseår &amp; åldersfärgkodning</summary>
@@ -105,8 +106,8 @@
 </section>
 
 <section>
-  <h2>5. Ej fakturering (perioder)</h2>
-  <div class="small" style="margin-bottom:10px;">Markera perioder då en person inte ska faktureras, med kommentar. Lämna "Till" tomt om perioden fortfarande pågår. Flera perioder per person går bra.</div>
+  <h2>5. Ej fakturering &amp; justerade belopp (perioder)</h2>
+  <div class="small" style="margin-bottom:10px;">Markera perioder då en person inte ska faktureras, med kommentar. Lämna "Till" tomt om perioden fortfarande pågår. Flera perioder per person går bra. Fyll i <strong>kr/mån</strong> för att i stället ersätta underlagets avgift med det beloppet varje månad i perioden (t.ex. när underlaget är fel) — tomt belopp betyder ej fakturering. Justeringen gäller månader som finns i underlaget; saknas en månad helt, lägg till den under avsnitt 3.</div>
   <details class="section-details" open>
     <summary>Perioder per person</summary>
     <div style="overflow-x:auto;">

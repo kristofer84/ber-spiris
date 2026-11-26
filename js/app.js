@@ -416,7 +416,7 @@ function renderUnderlagTable(){
     const tr = document.createElement('tr');
     const ageClass = ageClassForRow(r.namn, r.manad);
     if(ageClass) tr.classList.add(ageClass);
-    tr.innerHTML = `<td>${esc(monthKeyFromUnderlag(r.manad))}</td><td>${esc(r.namn)}</td>
+    tr.innerHTML = `<td>${esc(monthKeyFromUnderlag(r.manad))}</td><td>${esc(r.namn)}${r.generated ? ` <span class="tag cross" title="${esc(r.note)}">genererad</span>` : ''}</td>
       <td>${esc(r.mottagare)}</td><td class="num">${fmtNum(r.avgift)}</td>
       <td>${isManual ? `<button class="pill-btn" data-del="${manualIdx}">✕</button>` : ''}</td>`;
     tbody.appendChild(tr);
@@ -450,6 +450,59 @@ document.getElementById('add-manual').addEventListener('click', ()=>{
   renderBirthYearTable();
   renderMappingTable();
   renderExclusionsTable();
+});
+
+// Skapar manuella underlagsrader för kund+månader där det finns kundfakturor men inget underlag.
+// Namn väljs från mappningen: exakt ett namn mappat 100 % till kunden -> det namnet; inget namn
+// mappat -> kundnamnet (och mappningen skapas). Delade/flera namn är tvetydiga och hoppas över.
+document.getElementById('generate-underlag').addEventListener('click', ()=>{
+  runMatch();
+  const missing = lastMissingUnderlag;
+  if(!missing.length){
+    alert('Hittade inga fakturerade månader som helt saknar underlag (efter startdatum och ej fakturering-perioder).');
+    return;
+  }
+  const namesByKund = new Map(); // kundNr -> [{namn, entries}]
+  Object.keys(state.mapping).forEach(namn=>{
+    const entries = getMappingEntries(namn).filter(e=>e.kundNr);
+    entries.forEach(e=>{
+      if(!namesByKund.has(e.kundNr)) namesByKund.set(e.kundNr, []);
+      namesByKund.get(e.kundNr).push({namn, entries});
+    });
+  });
+  const toCreate = [], skipped = [], newMappings = {};
+  missing.forEach(m=>{
+    const mapped = namesByKund.get(m.kundNr) || [];
+    let namn = null;
+    if(mapped.length===1 && mapped[0].entries.length===1) namn = mapped[0].namn;
+    else if(mapped.length===0){
+      const existing = (state.mapping[m.kundNamn] ? getMappingEntries(m.kundNamn) : []).filter(e=>e.kundNr);
+      if(existing.length===0 || (existing.length===1 && existing[0].kundNr===m.kundNr)){
+        namn = m.kundNamn;
+        if(existing.length===0) newMappings[namn] = m.kundNr;
+      }
+    }
+    if(!namn){
+      skipped.push(`${m.kundNr} ${m.kundNamn} ${m.mk} (${mapped.length ? mapped.map(x=>x.namn).join(' / ') + ' — delad eller flera namn' : 'namnet är mappat till annan kund'})`);
+      return;
+    }
+    toCreate.push({id: nextRowId(), manad: m.serviceMk, namn, mottagare: m.kundNamn, avgift: m.belopp,
+      generated: true, note: `Genererad från faktura ${m.fakturanr.join(', ')}`});
+  });
+  const total = toCreate.reduce((s,r)=>s+r.avgift, 0);
+  let msg = `Skapa ${toCreate.length} manuella underlagsrad(er), totalt ${fmtNum(total)} kr?\n\n` +
+    toCreate.slice(0,15).map(r=>`${r.manad}  ${r.namn}  ${fmtNum(r.avgift)}`).join('\n') +
+    (toCreate.length>15 ? `\n… och ${toCreate.length-15} till` : '');
+  if(skipped.length) msg += `\n\nHoppas över (${skipped.length}), lägg till manuellt:\n` + skipped.slice(0,10).join('\n') + (skipped.length>10 ? '\n…' : '');
+  if(!toCreate.length){ alert(msg.replace(/^Skapa 0[^\n]*\n\n/, 'Inga rader kunde skapas automatiskt.\n\n')); return; }
+  if(!confirm(msg)) return;
+  Object.entries(newMappings).forEach(([namn, kundNr])=>{ state.mapping[namn] = [{kundNr, percent:100}]; });
+  state.manual.push(...toCreate);
+  renderUnderlagTable();
+  renderBirthYearTable();
+  renderMappingTable();
+  renderExclusionsTable();
+  runMatch();
 });
 
 document.getElementById('clear-manual-form').addEventListener('click', ()=>{
@@ -522,7 +575,8 @@ function renderMappingTable(){
     if(!byNamn.has(r.namn)) byNamn.set(r.namn, {mottagare: new Set(), anyActive: false});
     const entry = byNamn.get(r.namn);
     entry.mottagare.add(r.mottagare);
-    if(!findExclusionForRow(r)) entry.anyActive = true;
+    const p = findExclusionForRow(r);
+    if(!p || isOverridePeriod(p)) entry.anyActive = true; // justerat belopp ska fortfarande mappas
   });
   // hide names whose every row falls within an "ej fakturering"-period — nothing to map
   [...byNamn.keys()].forEach(namn=>{
@@ -606,7 +660,12 @@ function renderMappingTable(){
 }
 document.getElementById('mapping-unmapped-only').addEventListener('change', renderMappingTable);
 
-// ---------- exclusion periods (ej fakturering) ----------
+// ---------- perioder: ej fakturering ELLER justerat belopp ----------
+// En period med tomt belopp = ej fakturering (raderna utesluts). Med belopp = underlagets avgift
+// ersätts med det beloppet per månad i perioden (t.ex. när underlaget är fel).
+function isOverridePeriod(p){
+  return p && p.avgift !== undefined && p.avgift !== null && String(p.avgift).trim() !== '';
+}
 function getExclusionPeriods(namn){
   if(!state.exclusions[namn]) state.exclusions[namn] = [];
   return state.exclusions[namn];
@@ -627,7 +686,9 @@ function renderExclusionsTable(){
         <input type="text" class="period-month period-from" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.from)}" placeholder="2026-03">
         <span class="period-arrow">till</span>
         <input type="text" class="period-month period-to" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.to)}" placeholder="pågående">
-        <input type="text" class="period-comment" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.comment)}" placeholder="kommentar, t.ex. flyttat">
+        <input type="number" class="period-avgift" step="0.01" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.avgift)}" placeholder="ej fakt." title="Belopp per månad som ersätter underlaget. Tomt = ej fakturering.">
+        <span class="period-arrow">kr/mån</span>
+        <input type="text" class="period-comment" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.comment)}" placeholder="kommentar, t.ex. flyttat / fel i underlag">
         <button class="pill-btn" data-removeperiod="${esc(namn)}|${i}" title="Ta bort period">✕</button>
       </div>`).join('');
     rowsHtml += `<button class="period-add" data-addperiod="${esc(namn)}">+ lägg till period</button>`;
@@ -639,6 +700,12 @@ function renderExclusionsTable(){
     });
     tr.querySelectorAll('.period-to').forEach((inp,i)=>{
       inp.addEventListener('change', ()=>{ periods[i].to = inp.value.trim(); });
+    });
+    tr.querySelectorAll('.period-avgift').forEach((inp,i)=>{
+      inp.addEventListener('change', ()=>{
+        const v = inp.value.trim();
+        if(v==='') delete periods[i].avgift; else periods[i].avgift = parseSwedishNumber(v);
+      });
     });
     tr.querySelectorAll('.period-comment').forEach((inp,i)=>{
       inp.addEventListener('change', ()=>{ periods[i].comment = inp.value; });
@@ -679,7 +746,10 @@ document.getElementById('run-match').addEventListener('click', runMatch);
   });
 });
 
+// fyll i av runMatch: kund+faktureringsmånader med kundfakturor men helt utan underlag
+let lastMissingUnderlag = [];
 function runMatch(){
+  lastMissingUnderlag = [];
   state.invoiceOffset = parseInt(document.getElementById('invoice-offset').value, 10) || 0;
   state.startUnderlag = document.getElementById('start-underlag').value.trim();
   state.startReskontra = document.getElementById('start-reskontra').value.trim();
@@ -694,12 +764,26 @@ function runMatch(){
 
   const allRows = allUnderlagRows();
   const excludedRows = [];
+  // justerade belopp: per namn+månad ersätts underlagets SUMMA med periodens belopp (en rad behålls
+  // med nytt belopp, ev. övriga rader samma månad tas bort) — oavsett hur många rader underlaget har
+  const overrides = new Map(); // `${namn}|${mk}` -> {namn, mk, original, nytt, comment}
   let skippedUnderlagCount = 0;
-  const rows = allRows.filter(r=>{
-    if(startUnderlagKey && monthKeyFromUnderlag(r.manad) < startUnderlagKey){ skippedUnderlagCount++; return false; }
+  const rows = [];
+  allRows.forEach(r=>{
+    const rowMk = monthKeyFromUnderlag(r.manad);
+    if(startUnderlagKey && rowMk < startUnderlagKey){ skippedUnderlagCount++; return; }
     const period = findExclusionForRow(r);
-    if(period){ excludedRows.push({...r, comment: period.comment, periodFrom: period.from, periodTo: period.to}); return false; }
-    return true;
+    if(period && isOverridePeriod(period)){
+      const key = `${r.namn}|${rowMk}`;
+      const rec = overrides.get(key);
+      if(rec){ rec.original += r.avgift; return; }
+      const nytt = Number(period.avgift) || 0;
+      overrides.set(key, {namn:r.namn, mk:rowMk, original:r.avgift, nytt, comment:period.comment});
+      rows.push({...r, avgift:nytt});
+      return;
+    }
+    if(period){ excludedRows.push({...r, comment: period.comment, periodFrom: period.from, periodTo: period.to}); return; }
+    rows.push(r);
   });
   const reportEl = document.getElementById('report');
   if(allRows.length===0 || allReskontraRows().length===0){
@@ -710,6 +794,19 @@ function runMatch(){
   // faktureringsmånad = avser-månad förskjuten bakåt med invoiceOffset, så den går att jämföra
   // mot fakturadatumets kalendermånad i kundreskontralistan.
   const underlagByKund = new Map();
+  // kund -> namn mappade till kunden; används för att se om en månad avsiktligt saknar underlag
+  // (ej fakturering-period för något av namnen) och då inte ska få genererat underlag
+  const namesByKundNr = new Map();
+  Object.keys(state.mapping).forEach(namn=>{
+    getMappingEntries(namn).filter(e=>e.kundNr).forEach(e=>{
+      if(!namesByKundNr.has(e.kundNr)) namesByKundNr.set(e.kundNr, []);
+      namesByKundNr.get(e.kundNr).push(namn);
+    });
+  });
+  const isExcludedKundMonth = (kundNr, serviceMk)=>(namesByKundNr.get(kundNr) || []).some(namn=>{
+    const p = findExclusionForRow({namn, manad: serviceMk});
+    return p && !isOverridePeriod(p);
+  });
   const unmapped = [];
   rows.forEach(r=>{
     const entries = (getMappingEntries(r.namn) || []).filter(e=>e.kundNr);
@@ -835,6 +932,19 @@ function runMatch(){
       if(!invoicesByMonth.has(mk)) invoicesByMonth.set(mk, []);
       invoicesByMonth.get(mk).push(nr);
       allMonths.add(mk);
+    });
+
+    // fakturerade månader utan något underlag alls (kandidater för "Generera underlag")
+    invoicesByMonth.forEach((nrs, mk)=>{
+      if(uMap.has(mk)) return;
+      const kundfakturor = nrs.filter(nr=>invoices.get(nr).belopp > 0);
+      if(!kundfakturor.length) return;
+      const serviceMk = shiftMonthKey(mk, state.invoiceOffset);
+      if(startUnderlagKey && serviceMk < startUnderlagKey) return;
+      if(isExcludedKundMonth(kundNr, serviceMk)) return;
+      const belopp = (lMap.get(mk)?.debet) || 0;
+      if(belopp < 1) return;
+      lastMissingUnderlag.push({kundNr, kundNamn, mk, serviceMk, belopp, fakturanr: kundfakturor});
     });
 
     let custHtml = '';
@@ -1041,6 +1151,29 @@ function runMatch(){
   if(unmapped.length){
     const names = [...new Set(unmapped.map(r=>r.namn))];
     html += `<div class="small" style="margin-top:6px;"><span class="tag unmapped">Ej mappade</span> ${esc(names.join(', '))} — gå till avsnitt 4 för att koppla dessa.</div>`;
+  }
+
+  if(overrides.size){
+    const byNamn = new Map();
+    overrides.forEach(o=>{
+      if(!byNamn.has(o.namn)) byNamn.set(o.namn, []);
+      byNamn.get(o.namn).push(o);
+    });
+    html += `<div class="excl-group-wrap"><h3 class="excl-group-title">Justerade underlag (belopp ersatt via period i avsnitt 5)</h3>`;
+    [...byNamn.entries()].sort((a,b)=>a[0].localeCompare(b[0],'sv')).forEach(([namn, list])=>{
+      const diff = list.reduce((s,o)=>s + o.nytt - o.original, 0);
+      html += `<details class="excl-group"><summary>
+          <span class="excl-namn">${esc(namn)}</span>
+          <span class="excl-meta">${list.length} månad(er) · justering ${diff>0?'+':''}${fmtNum(diff)} kr</span>
+        </summary>
+        <table><thead><tr><th>Månad</th><th class="num">Underlag</th><th class="num">Justerat</th><th class="num">Skillnad</th><th>Kommentar</th></tr></thead><tbody>`;
+      list.sort((a,b)=>a.mk.localeCompare(b.mk)).forEach(o=>{
+        html += `<tr><td>${esc(o.mk)}</td><td class="num">${fmtNum(o.original)}</td><td class="num">${fmtNum(o.nytt)}</td>
+          <td class="num">${fmtNum(o.nytt - o.original)}</td><td>${esc(o.comment)}</td></tr>`;
+      });
+      html += `</tbody></table></details>`;
+    });
+    html += `</div>`;
   }
 
   if(excludedRows.length){
