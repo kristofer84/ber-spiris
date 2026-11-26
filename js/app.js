@@ -1,4 +1,4 @@
-const state = { underlagFiles: [], manual: [], reskontraFiles: [], manualIdentities: {}, mapping: {}, exclusions: {}, invoiceOffset: 1, startUnderlag: '', startReskontra: '', approvedDiffs: {}, birthYears: {}, paymentOverrides: {}, excludedReskontraRows: {} };
+const state = { underlagFiles: [], manual: [], reskontraFiles: [], manualIdentities: {}, mapping: {}, exclusions: {}, invoiceOffset: 1, startUnderlag: '', startReskontra: '', approvedDiffs: {}, birthYears: {}, paymentOverrides: {}, excludedReskontraRows: {}, rowMonthOverrides: {} };
 
 // ---------- helpers ----------
 function parseSwedishNumber(s){
@@ -267,6 +267,14 @@ function todayIso(){
 }
 function rowMonthDate(t){
   return (t.debet!==0 && t.fakturadatum) ? t.fakturadatum : t.datum;
+}
+// månaden raden naturligt hör till (fakturadatum/verifikationsdatum)
+function naturalMonth(t){
+  return monthKeyFromDate(rowMonthDate(t));
+}
+// månaden raden räknas i: manuellt flyttad ("Flytta till månad") eller den naturliga
+function effMonth(t){
+  return state.rowMonthOverrides[t.id] || naturalMonth(t);
 }
 // regleringsstatus för ett belopp (faktura >0, kreditfaktura <0) givet reglerat belopp i samma tecken
 function settleStatusTag(belopp, settled, {creditOnly=false}={}){
@@ -931,33 +939,68 @@ function runMatch(){
   // Avgränsning mot startdatum: rader före startdatum ignoreras, OCH inbetalningar inom perioden som
   // betalar en faktura från före startdatum (sen betalning). De reglerar en skuld som ligger utanför
   // perioden — tas de med blir saldot negativt och betalningen går inte att matcha.
+  // En manuellt flyttad rad avgörs av sin nya månad (jämfört med startdatumets månad), annars datumet.
+  const startMonth = startReskontraKey ? startReskontraKey.slice(0,7) : null;
+  const isBeforeStart = t=>{
+    if(!startReskontraKey) return false;
+    const ov = state.rowMonthOverrides[t.id];
+    return ov ? ov < startMonth : t.datum < startReskontraKey;
+  };
   const preStartInvoices = new Set(); // `${kundNr}|${fakturanr}` för fakturor före startdatum
   const inPeriodInvoices = new Set();
   if(startReskontraKey){
     allReskontraRows().forEach(t=>{
       if(t.debet===0 || !t.fakturanr) return;
-      (t.datum < startReskontraKey ? preStartInvoices : inPeriodInvoices).add(`${t.kundNr}|${t.fakturanr}`);
+      (isBeforeStart(t) ? preStartInvoices : inPeriodInvoices).add(`${t.kundNr}|${t.fakturanr}`);
+    });
+  }
+  const isPreStartInvoice = key=>preStartInvoices.has(key) && !inPeriodInvoices.has(key);
+  // Kreditfakturor inom perioden som kvittas mot en faktura före startdatum hör också till den gamla
+  // perioden (annars blir saldot negativt). Kvittningsparet (kredit −X, faktura +X) har inte samma
+  // vernr, men samma kund, datum och belopp — para ihop dem på det.
+  const prePeriodCredits = new Set(); // `${kundNr}|${kreditens fakturanr}`
+  if(startReskontraKey){
+    const groups = new Map(); // `${kundNr}|${datum}|${|belopp|}` -> {pos:[nr], neg:[nr]}
+    allReskontraRows().forEach(t=>{
+      if(t.typ!=='kvittning' || !t.fakturanr || !t.kvittningsBelopp || isBeforeStart(t)) return;
+      const gk = `${t.kundNr}|${t.datum}|${Math.abs(t.kvittningsBelopp).toFixed(2)}`;
+      const g = groups.get(gk) || {pos:[], neg:[]};
+      (t.kvittningsBelopp > 0 ? g.pos : g.neg).push(t.fakturanr);
+      groups.set(gk, g);
+    });
+    groups.forEach((g, gk)=>{
+      const kundNr = gk.split('|')[0];
+      if(g.pos.length && g.pos.every(nr=>isPreStartInvoice(`${kundNr}|${nr}`))){
+        g.neg.forEach(nr=>prePeriodCredits.add(`${kundNr}|${nr}`));
+      }
     });
   }
   // null = ingår i avstämningen, annars orsak till att raden ligger utanför perioden
   const outOfPeriod = t=>{
     if(!startReskontraKey) return null;
-    if(t.datum < startReskontraKey) return 'before';
+    if(isBeforeStart(t)) return 'before';
+    if(state.rowMonthOverrides[t.id]) return null; // uttryckligen flyttad in i perioden
     if(t.kredit>0){
       const key = `${t.kundNr}|${effectiveFakturanr(t)}`;
-      if(preStartInvoices.has(key) && !inPeriodInvoices.has(key)) return 'prePeriodInvoice';
+      if(isPreStartInvoice(key)) return 'prePeriodInvoice';
+    }
+    if(t.fakturanr && (t.debet<0 || t.typ==='kvittning')){
+      const key = `${t.kundNr}|${t.fakturanr}`;
+      if(prePeriodCredits.has(key)) return 'prePeriodCredit';
+      if(t.typ==='kvittning' && isPreStartInvoice(key)) return 'prePeriodCredit'; // mottagande sidan
     }
     return null;
   };
 
   const ledgerByKund = new Map();
-  let skippedLedgerCount = 0, skippedLatePayments = 0;
+  let skippedLedgerCount = 0, skippedLatePayments = 0, skippedLateCredits = 0;
   allReskontraRows().forEach(t=>{
     if(!t.kundNr) return;
     const oop = outOfPeriod(t);
     if(oop==='before'){ skippedLedgerCount++; return; }
+    if(oop==='prePeriodCredit'){ if(t.typ!=='kvittning') skippedLateCredits++; return; }
     if(oop){ skippedLatePayments++; return; }
-    const mk = monthKeyFromDate(rowMonthDate(t));
+    const mk = effMonth(t);
     if(!ledgerByKund.has(t.kundNr)) ledgerByKund.set(t.kundNr, new Map());
     const monthMap = ledgerByKund.get(t.kundNr);
     const cur = monthMap.get(mk) || {debet:0, kredit:0};
@@ -988,14 +1031,16 @@ function runMatch(){
       t.kundNr===kundNr && !outOfPeriod(t));
     // Flera debetrader med samma fakturanummer (t.ex. faktura + korrigering) summeras till EN
     // faktura, så fakturavyn och Fakturerat alltid bygger på samma belopp.
-    const invoices = new Map(); // fakturanr -> {datum, forfallodatum, belopp, rader}
+    const invoices = new Map(); // fakturanr -> {datum, mk, forfallodatum, belopp, rader}
     custReskontraRows.forEach(t=>{
       if(t.debet===0 || !t.fakturanr) return;
       const d = rowMonthDate(t);
+      const mk = effMonth(t);
       const cur = invoices.get(t.fakturanr);
-      if(!cur){ invoices.set(t.fakturanr, {datum:d, forfallodatum:t.forfallodatum||'', belopp:t.debet, rader:1}); return; }
+      if(!cur){ invoices.set(t.fakturanr, {datum:d, mk, forfallodatum:t.forfallodatum||'', belopp:t.debet, rader:1}); return; }
       cur.belopp += t.debet; cur.rader++;
       if(d < cur.datum) cur.datum = d;
+      if(mk < cur.mk) cur.mk = mk;
       if((t.forfallodatum||'') > cur.forfallodatum) cur.forfallodatum = t.forfallodatum;
     });
     const paymentsByInvoice = new Map(); // fakturanr -> {paid, lastDatum}
@@ -1029,10 +1074,10 @@ function runMatch(){
     const settledFor = (nr, inv)=> inv.belopp < 0
       ? -(creditConsumed.get(nr) || 0)
       : (paymentsByInvoice.get(nr)?.paid || 0) + (creditAppliedByInvoice.get(nr) || 0);
-    // fakturor per månad (fakturans tidigaste fakturadatum) — varje faktura räknas i exakt en månad
+    // fakturor per månad (fakturans tidigaste, ev. flyttade, månad) — varje faktura räknas i exakt en månad
     const invoicesByMonth = new Map();
     invoices.forEach((inv, nr)=>{
-      const mk = monthKeyFromDate(inv.datum);
+      const mk = inv.mk;
       if(!invoicesByMonth.has(mk)) invoicesByMonth.set(mk, []);
       invoicesByMonth.get(mk).push(nr);
       allMonths.add(mk);
@@ -1052,32 +1097,56 @@ function runMatch(){
     });
 
     let custHtml = '';
-    let hasDeviation = false;
     let hiddenOkMonths = 0;
     let monthRowsHtml = '';
     // löpande summor räknas över ALLA månader, även de som döljs av "Dölj månader som stämmer"
     let runDiffUF = 0, runSaldo = 0;
 
-    [...allMonths].sort().forEach(mk=>{
+    // pass 1: siffror per månad
+    const monthData = [...allMonths].sort().map(mk=>{
       const underlagSum = uMap.get(mk) || 0;
       const led = lMap.get(mk) || {debet:0, kredit:0};
       const monthFakturanr = (invoicesByMonth.get(mk) || []).sort((a,b)=>a.localeCompare(b,'sv',{numeric:true}));
-      const fakturanrList = monthFakturanr.join(', ');
       const diffUF = led.debet - underlagSum;
+      const approveKey = `${kundNr}|${mk}`;
+      return {mk, underlagSum, led, monthFakturanr, diffUF, approveKey,
+        okUF: Math.abs(diffUF) < 1, approved: !!state.approvedDiffs[approveKey], shifted: false};
+    });
+    // pass 2: periodförskjutning. En faktura/kvittning i "fel" månad ger +X en månad och −X en annan.
+    // Går alla ej godkända avvikelser jämnt ut över perioden är det bara timing; annars paras exakt
+    // motsatta avvikelser ihop. Det som blir kvar är verkliga avvikelser.
+    const openMonths = monthData.filter(m=>!m.okUF && !m.approved);
+    if(openMonths.length && Math.abs(openMonths.reduce((s,m)=>s+m.diffUF, 0)) < 1){
+      openMonths.forEach(m=>{ m.shifted = true; });
+    } else {
+      openMonths.forEach((a, i)=>{
+        if(a.shifted) return;
+        const b = openMonths.slice(i+1).find(b=>!b.shifted && Math.abs(a.diffUF + b.diffUF) < 1);
+        if(b){ a.shifted = true; b.shifted = true; }
+      });
+    }
+    const realDeviations = openMonths.filter(m=>!m.shifted);
+    const hasDeviation = realDeviations.length > 0;
+    const deviationSum = realDeviations.reduce((s,m)=>s+m.diffUF, 0);
+    const shiftedCount = openMonths.length - realDeviations.length;
+
+    monthData.forEach(({mk, underlagSum, led, monthFakturanr, diffUF, approveKey, okUF, approved, shifted})=>{
+      const fakturanrList = monthFakturanr.join(', ');
       custTotalUnderlag += underlagSum; custTotalDebet += led.debet;
 
       // regleringsstatus för just de fakturor som utfärdades denna månad, matchat på fakturanummer
       const monthBelopp = monthFakturanr.reduce((s,nr)=>s + invoices.get(nr).belopp, 0);
       const monthSettled = monthFakturanr.reduce((s,nr)=>s + settledFor(nr, invoices.get(nr)), 0);
 
-      const okUF = Math.abs(diffUF) < 1;
-      const approveKey = `${kundNr}|${mk}`;
-      const approved = !!state.approvedDiffs[approveKey];
-      if(!okUF && !approved) hasDeviation = true;
-      const rowClass = (!okUF && !approved) ? 'warn' : '';
+      const isDeviation = !okUF && !approved && !shifted;
+      const rowClass = isDeviation ? 'warn' : (shifted && !approved ? 'shift-row' : '');
+      const sign = diffUF>0?'+':'';
       const statusUF = approved
         ? '<span class="tag approved">Godkänd</span>'
-        : (okUF ? '<span class="tag ok">Stämmer</span>' : `<span class="tag warn">Avviker ${diffUF>0?'+':''}${fmtNum(diffUF)}</span>`);
+        : (okUF ? '<span class="tag ok">Stämmer</span>'
+          : (shifted
+            ? `<span class="tag shift" title="Motsvaras av en avvikelse i en annan månad — summan över perioden går jämnt ut. Flytta raden under Alla transaktioner om du vill rätta månaden.">Förskjuten ${sign}${fmtNum(diffUF)}</span>`
+            : `<span class="tag warn">Avviker ${sign}${fmtNum(diffUF)}</span>`));
 
       const statusBetalning = monthFakturanr.length===0 ? '' : settleStatusTag(monthBelopp, monthSettled);
       runDiffUF += diffUF;
@@ -1089,7 +1158,7 @@ function runMatch(){
         <td>${esc(fakturanrList)}</td>
         <td class="num">${fmtNum(underlagSum)}</td>
         <td class="num">${fmtNum(led.debet)}</td>
-        <td class="num ${okUF||approved?'diff-zero':'diff-pos'}">${fmtNum(diffUF)}</td>
+        <td class="num ${isDeviation?'diff-pos':'diff-zero'}">${fmtNum(diffUF)}</td>
         <td class="num saldo">${fmtNum(runDiffUF)}</td>
         <td>${statusUF}</td>
         <td><input type="checkbox" class="approve-check" data-key="${esc(approveKey)}" ${approved?'checked':''}></td>
@@ -1202,14 +1271,20 @@ function runMatch(){
           const inScope = !excluded && !beforeStart;
           if(inScope) slutsaldo += t.debet - t.kredit;
           const saldoCell = inScope ? fmtNum(slutsaldo) : '—';
+          const nat = naturalMonth(t);
+          const ov = state.rowMonthOverrides[t.id] || '';
           const notes = [
+            ov ? `<span class="tag shift">Flyttad från ${esc(nat)}</span>` : '',
             t.note ? `<span class="tag cross">${esc(t.note)}</span>` : '',
             oop==='before' ? '<span class="tag unmapped">Före startdatum</span>' : '',
-            oop==='prePeriodInvoice' ? '<span class="tag unmapped">Betalar faktura före startdatum</span>' : ''
+            oop==='prePeriodInvoice' ? '<span class="tag unmapped">Betalar faktura före startdatum</span>' : '',
+            oop==='prePeriodCredit' ? '<span class="tag unmapped">Krediterar faktura före startdatum</span>' : ''
           ].join('');
           txHtml += `<tr class="${excluded?'excluded-row':(beforeStart?'muted-row':'')}">
             <td><input type="checkbox" class="row-exclude" data-id="${esc(t.id)}" ${excluded?'checked':''}></td>
-            <td>${esc(t.vernr)}</td><td>${esc(t.datum)}</td><td>${esc(t.typ)}</td><td>${esc(t.beskrivning)}</td>
+            <td>${esc(t.vernr)}</td><td>${esc(t.datum)}</td>
+            <td><input type="text" class="row-month" data-id="${esc(t.id)}" data-natural="${esc(nat)}" value="${esc(ov)}" placeholder="${esc(nat)}" title="Månad raden räknas i. Skriv en annan månad (ÅÅÅÅ-MM) om raden hamnat i fel period; töm för att återställa."></td>
+            <td>${esc(t.typ)}</td><td>${esc(t.beskrivning)}</td>
             <td class="num">${fmtNum(t.debet)}</td><td class="num">${fmtNum(t.kredit)}</td>
             <td class="num saldo">${saldoCell}</td>
             <td>${esc(effectiveFakturanr(t))}</td>
@@ -1217,18 +1292,20 @@ function runMatch(){
         });
       custHtml += `<details class="excl-group"><summary>
           <span class="excl-namn">Alla transaktioner (granska)</span>
-          <span class="excl-meta">${rawRowsForKund.length} rad(er) · slutsaldo ${fmtNum(slutsaldo)} · kryssa för att utesluta en rad ur alla summeringar</span>
+          <span class="excl-meta">${rawRowsForKund.length} rad(er) · slutsaldo ${fmtNum(slutsaldo)} · kryssa för att utesluta en rad, ändra Månad för att flytta den till rätt period</span>
         </summary>
-        <table><thead><tr><th>Uteslut</th><th>Vernr</th><th>Datum</th><th>Typ</th><th>Beskrivning</th>
+        <table><thead><tr><th>Uteslut</th><th>Vernr</th><th>Datum</th><th title="Månad raden räknas i — går att ändra">Månad</th><th>Typ</th><th>Beskrivning</th>
         <th class="num">Debet</th><th class="num">Kredit</th><th class="num">Saldo</th><th>Fakturanr</th><th>Anmärkning</th></tr></thead><tbody>
         ${txHtml}
-        <tr class="group-head"><td colspan="7">Slutsaldo</td><td class="num saldo">${fmtNum(slutsaldo)}</td><td colspan="2"></td></tr>
+        <tr class="group-head"><td colspan="8">Slutsaldo</td><td class="num saldo">${fmtNum(slutsaldo)}</td><td colspan="2"></td></tr>
         </tbody></table></details>`;
     }
 // sammanfattande badges i rubriken + kollapsbar kundgrupp
-    const ufBadge = Math.abs(totalDiffUF) < 1
-      ? (hasDeviation ? '<span class="tag warn">Månadsavvikelser</span>' : '<span class="tag ok">U/F stämmer</span>')
-      : `<span class="tag warn">Diff U/F ${totalDiffUF>0?'+':''}${fmtNum(totalDiffUF)}</span>`;
+    const ufBadge = hasDeviation
+      ? `<span class="tag warn">Avviker U/F ${deviationSum>0?'+':''}${fmtNum(deviationSum)}</span>`
+      : (shiftedCount
+        ? `<span class="tag shift" title="${shiftedCount} månad(er) avviker men tar ut varandra över perioden">U/F stämmer · periodförskjutning</span>`
+        : '<span class="tag ok">U/F stämmer</span>');
     const utBadge = hasOutstanding
       ? (onlyNotDue
         ? `<span class="tag approved">Utestående ${fmtNum(utestaende)}, ej förfallet</span>`
@@ -1303,8 +1380,8 @@ function runMatch(){
     html += `</div>`;
   }
 
-  if(skippedUnderlagCount || skippedLedgerCount || skippedLatePayments){
-    html += `<div class="small" style="margin-top:10px;">Ignorerat pga startdatum: ${skippedUnderlagCount} underlagsrad(er), ${skippedLedgerCount} reskontratransaktion(er)${skippedLatePayments ? `, ${skippedLatePayments} inbetalning(ar) av fakturor före startdatum` : ''}.</div>`;
+  if(skippedUnderlagCount || skippedLedgerCount || skippedLatePayments || skippedLateCredits){
+    html += `<div class="small" style="margin-top:10px;">Ignorerat pga startdatum: ${skippedUnderlagCount} underlagsrad(er), ${skippedLedgerCount} reskontratransaktion(er)${skippedLatePayments ? `, ${skippedLatePayments} inbetalning(ar) av fakturor före startdatum` : ''}${skippedLateCredits ? `, ${skippedLateCredits} kreditfaktura(or) mot fakturor före startdatum` : ''}.</div>`;
   }
 
   reportEl.innerHTML = html;
@@ -1319,6 +1396,15 @@ function runMatch(){
     sel.addEventListener('change', ()=>{
       if(sel.value) state.paymentOverrides[sel.dataset.id] = sel.value;
       else delete state.paymentOverrides[sel.dataset.id];
+      runMatch();
+    });
+  });
+  reportEl.querySelectorAll('.row-month').forEach(inp=>{
+    inp.addEventListener('change', ()=>{
+      const v = inp.value.trim() ? monthKeyFromUnderlag(inp.value.trim()) : '';
+      if(v && !/^\d{4}-\d{2}$/.test(v)){ alert('Ange månad som ÅÅÅÅ-MM, t.ex. 2026-07.'); inp.value = state.rowMonthOverrides[inp.dataset.id] || ''; return; }
+      if(v && v !== inp.dataset.natural) state.rowMonthOverrides[inp.dataset.id] = v;
+      else delete state.rowMonthOverrides[inp.dataset.id];
       runMatch();
     });
   });
@@ -1360,6 +1446,7 @@ document.getElementById('import-state').addEventListener('change', e=>{
       state.paymentOverrides = loaded.paymentOverrides || {};
       migratePaymentOverrides();
       state.excludedReskontraRows = loaded.excludedReskontraRows || {};
+      state.rowMonthOverrides = loaded.rowMonthOverrides || {};
       state.mapping = loaded.mapping || {};
       state.exclusions = loaded.exclusions || {};
       migrateUnderlagState();

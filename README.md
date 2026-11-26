@@ -13,6 +13,8 @@ Live: https://kristofer84.github.io/ber-spiris/
 - Automatisk åldersfärgkodning baserat på personnummer i underlaget
 - Avstämning per kund och månad: underlag vs. fakturerat, samt betalningsstatus per faktura
 - Transaktionslogg per kund med löpande saldo; varnar när slutsaldot inte stämmer med utestående (ej kopplade inbetalningar)
+- Status per kund utifrån hela perioden: månader som tar ut varandra (t.ex. en faktura bokförd en månad för tidigt) visas som periodförskjutning, inte avvikelse
+- Flytta enskilda transaktioner (faktura, kvittning, inbetalning) till rätt månad direkt i transaktionsloggen
 - Exportera/importera hela arbetstillståndet som JSON för att spara mellan sessioner
 
 ## Struktur

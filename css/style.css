@@ -151,6 +151,9 @@ tr.warn:hover td{background:#f2ddd0;}
 .tag.pay-warn{background:var(--pay-soft);color:var(--pay);}
 .tag.approved{background:var(--approve-soft);color:var(--approve);}
 .tag.cross{background:#f1eee6;color:#7a6a3f;}
+.tag.shift{background:#e8eef7;color:#3d5a80;}
+tr.shift-row td{background:#f6f8fb;}
+input.row-month{width:78px;min-width:78px;}
 .excl-group-wrap{margin-top:18px;}
 .excl-group-title{
   font-size:13px;text-transform:uppercase;letter-spacing:1.2px;color:var(--ink-soft);
