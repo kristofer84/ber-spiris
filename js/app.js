@@ -9,6 +9,11 @@ function parseSwedishNumber(s){
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 }
+// escapa text från CSV-filer innan den läggs in via innerHTML — ett '<' eller '&' i en
+// beskrivning ska visas som text, inte tolkas som markup. Säkert även i attribut ("...").
+function esc(v){
+  return String(v ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function fmtNum(n){
   return n.toLocaleString('sv-SE', {minimumFractionDigits:2, maximumFractionDigits:2});
 }
@@ -108,7 +113,10 @@ function parseReskontraCsv(text){
   const lines = text.split(/\r?\n/);
   let currentKundNr = '', currentKundNamn = '';
   const out = [];
-  const seen = new Set(); // skydd mot exakta dubblettrader (samma rad två gånger i filen)
+  // skydd mot exakta dubblettrader (samma rad två gånger i filen). Jämför HELA raden — två rader som
+  // bara delar vernr/fakturanr/belopp men skiljer sig i t.ex. datum eller text är legitima och behålls.
+  const seenLines = new Set();
+  const idCount = new Map(); // id-format oförändrat (sparade uteslutningar refererar till det); krockar får suffix
   for(let i=0;i<lines.length;i++){
     if(lines[i].trim()==='') continue;
     const cells = parseCsvLine(lines[i]).map(cleanCell);
@@ -129,9 +137,13 @@ function parseReskontraCsv(text){
     const descMatch = (beskrivning||'').match(/(\d+)\s*$/);
     const fakturanr = descMatch ? descMatch[1] : (fakturanummerKolumn||'');
     const hasDates = !!(fakturadatum && forfallodatum);
-    const sig = `${currentKundNr}|${vernr}|${fakturanr}|${belopp}|${hasDates?'d':'u'}`;
-    if(seen.has(sig)) continue;
-    seen.add(sig);
+    const lineSig = currentKundNr + '\u0001' + cells.join('\u0001');
+    if(seenLines.has(lineSig)) continue;
+    seenLines.add(lineSig);
+    const baseSig = `${currentKundNr}|${vernr}|${fakturanr}|${belopp}|${hasDates?'d':'u'}`;
+    const n = (idCount.get(baseSig) || 0) + 1;
+    idCount.set(baseSig, n);
+    const sig = n===1 ? baseSig : `${baseSig}#${n}`;
 
     const beskrLower = (beskrivning||'').toLowerCase();
     const isFakturaRad = beskrLower.includes('kundfaktura') || beskrLower.includes('kreditfaktura');
@@ -244,8 +256,39 @@ function allReskontraRows(){
 }
 // använder en manuell betalning→faktura-koppling om en sådan satts (t.ex. när Beskrivning
 // saknar ett utläsbart fakturanummer), annars det automatiskt tolkade fakturanumret.
+// Kopplingen nycklas på radens id (unikt per kund+rad) — inte vernr, som kan återkomma hos flera
+// kunder/filer — och gäller bara inbetalningar (kredit), aldrig fakturarader.
 function effectiveFakturanr(t){
-  return state.paymentOverrides[t.vernr] || t.fakturanr;
+  if(t.kredit>0 && state.paymentOverrides[t.id]) return state.paymentOverrides[t.id];
+  return t.fakturanr;
+}
+// datum som avgör vilken månad en rad hör till: fakturadatum för fakturarader, annars verifikationsdatum
+function rowMonthDate(t){
+  return (t.debet!==0 && t.fakturadatum) ? t.fakturadatum : t.datum;
+}
+// regleringsstatus för ett belopp (faktura >0, kreditfaktura <0) givet reglerat belopp i samma tecken
+function settleStatusTag(belopp, settled, {creditOnly=false}={}){
+  const rest = belopp - settled;
+  if(belopp < 0){
+    if(Math.abs(rest) < 1) return '<span class="tag ok">Kvittad</span>';
+    if(rest >= 1) return `<span class="tag warn">Överkvittad ${fmtNum(rest)}</span>`;
+    if(settled < 0) return `<span class="tag pay-warn">Delvis kvittad, ${fmtNum(-rest)} kvar</span>`;
+    return '<span class="tag cross">Kreditfaktura (ej kvittad)</span>';
+  }
+  if(Math.abs(rest) < 1) return creditOnly ? '<span class="tag ok">Krediterad</span>' : '<span class="tag ok">Betald</span>';
+  if(rest <= -1) return `<span class="tag warn">Överbetald ${fmtNum(-rest)}</span>`;
+  if(settled > 0) return `<span class="tag pay-warn">Delvis, ${fmtNum(rest)} kvar</span>`;
+  return '<span class="tag warn">Obetald</span>';
+}
+// äldre exporter nycklade kopplingar på vernr; flytta dem till rad-id för de inbetalningar som har det vernr
+function migratePaymentOverrides(){
+  const ov = state.paymentOverrides;
+  const rows = allReskontraRowsRaw();
+  Object.keys(ov).forEach(key=>{
+    if(key.includes('|')) return; // redan rad-id
+    rows.filter(t=>t.vernr===key && t.kredit>0).forEach(t=>{ if(!ov[t.id]) ov[t.id] = ov[key]; });
+    delete ov[key];
+  });
 }
 function renderReskontraFileList(){
   const el = document.getElementById('filelist-reskontra');
@@ -260,7 +303,7 @@ function renderReskontraFileList(){
   state.reskontraFiles.forEach((f, idx)=>{
     totalRows += f.rows.length;
     const li = document.createElement('li');
-    li.innerHTML = `<span><span class="fname">${f.name}</span><span class="fcount">${f.rows.length} transaktioner</span></span>
+    li.innerHTML = `<span><span class="fname">${esc(f.name)}</span><span class="fcount">${f.rows.length} transaktioner</span></span>
       <button class="frem" data-idx="${idx}" title="Ta bort fil">✕</button>`;
     el.appendChild(li);
   });
@@ -289,7 +332,7 @@ function renderUnderlagFileList(){
   state.underlagFiles.forEach((f, idx)=>{
     totalRows += f.rows.length;
     const li = document.createElement('li');
-    li.innerHTML = `<span><span class="fname">${f.name}</span><span class="fcount">${f.rows.length} rader</span></span>
+    li.innerHTML = `<span><span class="fname">${esc(f.name)}</span><span class="fcount">${f.rows.length} rader</span></span>
       <button class="frem" data-idx="${idx}" title="Ta bort fil">✕</button>`;
     el.appendChild(li);
   });
@@ -337,7 +380,7 @@ function renderBirthYearTable(){
   namn.forEach(n=>{
     const tr = document.createElement('tr');
     const val = state.birthYears[n] || '';
-    tr.innerHTML = `<td>${n}</td><td><input type="number" class="birthyear-input" data-namn="${n}" value="${val}" placeholder="ÅÅÅÅ" min="1990" max="2030"></td>`;
+    tr.innerHTML = `<td>${esc(n)}</td><td><input type="number" class="birthyear-input" data-namn="${esc(n)}" value="${esc(val)}" placeholder="ÅÅÅÅ" min="1990" max="2030"></td>`;
     tbody.appendChild(tr);
   });
   tbody.querySelectorAll('.birthyear-input').forEach(inp=>{
@@ -369,8 +412,8 @@ function renderUnderlagTable(){
     const tr = document.createElement('tr');
     const ageClass = ageClassForRow(r.namn, r.manad);
     if(ageClass) tr.classList.add(ageClass);
-    tr.innerHTML = `<td>${monthKeyFromUnderlag(r.manad)}</td><td>${r.namn}</td>
-      <td>${r.mottagare}</td><td class="num">${fmtNum(r.avgift)}</td>
+    tr.innerHTML = `<td>${esc(monthKeyFromUnderlag(r.manad))}</td><td>${esc(r.namn)}</td>
+      <td>${esc(r.mottagare)}</td><td class="num">${fmtNum(r.avgift)}</td>
       <td>${isManual ? `<button class="pill-btn" data-del="${manualIdx}">✕</button>` : ''}</td>`;
     tbody.appendChild(tr);
   });
@@ -442,8 +485,8 @@ function renderManualKundList(){
   const entries = Object.entries(state.manualIdentities);
   entries.sort((a,b)=>a[0].localeCompare(b[0])).forEach(([kundNr, kundNamn])=>{
     const li = document.createElement('li');
-    li.innerHTML = `<span><span class="fname">${kundNr}</span><span class="fcount">${kundNamn}</span></span>
-      <button class="frem" data-kundnr="${kundNr}" title="Ta bort">✕</button>`;
+    li.innerHTML = `<span><span class="fname">${esc(kundNr)}</span><span class="fcount">${esc(kundNamn)}</span></span>
+      <button class="frem" data-kundnr="${esc(kundNr)}" title="Ta bort">✕</button>`;
     el.appendChild(li);
   });
   el.querySelectorAll('[data-kundnr]').forEach(btn=>{
@@ -486,7 +529,7 @@ function renderMappingTable(){
     return;
   }
   const identities = ledgerIdentities();
-  const identityOptions = [...identities.entries()].map(([nr,nm])=>`<option value="${nr}">${nr} — ${nm}</option>`).join('');
+  const identityOptions = [...identities.entries()].map(([nr,nm])=>`<option value="${esc(nr)}">${esc(nr)} — ${esc(nm)}</option>`).join('');
   const unmappedOnly = document.getElementById('mapping-unmapped-only').checked;
 
   let shown = 0;
@@ -503,20 +546,20 @@ function renderMappingTable(){
 
     let entriesHtml = entries.map((entry, i)=>`
       <div class="split-row">
-        <select data-namn="${namn}" data-idx="${i}" class="split-select">
+        <select data-namn="${esc(namn)}" data-idx="${i}" class="split-select">
           <option value="">— ej mappad —</option>
           ${identityOptions}
         </select>
-        ${multi ? `<input type="number" class="split-percent" data-namn="${namn}" data-idx="${i}" value="${entry.percent}" min="0" max="100" step="1">%` : ''}
-        ${multi ? `<button class="pill-btn" data-remove="${namn}|${i}" title="Ta bort delning">✕</button>` : ''}
+        ${multi ? `<input type="number" class="split-percent" data-namn="${esc(namn)}" data-idx="${i}" value="${entry.percent}" min="0" max="100" step="1">%` : ''}
+        ${multi ? `<button class="pill-btn" data-remove="${esc(namn)}|${i}" title="Ta bort delning">✕</button>` : ''}
       </div>`).join('');
 
-    entriesHtml += `<button class="split-add" data-addsplit="${namn}">+ dela på fler kunder</button>`;
+    entriesHtml += `<button class="split-add" data-addsplit="${esc(namn)}">+ dela på fler kunder</button>`;
     if(multi){
       entriesHtml += `<span class="split-sum ${sumOk?'':'split-sum-bad'}">Summa: ${sum}%</span>`;
     }
 
-    tr.innerHTML = `<td>${namn}</td><td class="small">${[...mottagareSet].filter(Boolean).join(', ')}</td>
+    tr.innerHTML = `<td>${esc(namn)}</td><td class="small">${esc([...mottagareSet].filter(Boolean).join(', '))}</td>
       <td class="split-cell">${entriesHtml}</td>`;
     tbody.appendChild(tr);
 
@@ -577,14 +620,14 @@ function renderExclusionsTable(){
     const tr = document.createElement('tr');
     let rowsHtml = periods.map((p, i)=>`
       <div class="period-row">
-        <input type="text" class="period-month period-from" data-namn="${namn}" data-idx="${i}" value="${p.from||''}" placeholder="2026-03">
+        <input type="text" class="period-month period-from" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.from)}" placeholder="2026-03">
         <span class="period-arrow">till</span>
-        <input type="text" class="period-month period-to" data-namn="${namn}" data-idx="${i}" value="${p.to||''}" placeholder="pågående">
-        <input type="text" class="period-comment" data-namn="${namn}" data-idx="${i}" value="${(p.comment||'').replace(/"/g,'&quot;')}" placeholder="kommentar, t.ex. flyttat">
-        <button class="pill-btn" data-removeperiod="${namn}|${i}" title="Ta bort period">✕</button>
+        <input type="text" class="period-month period-to" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.to)}" placeholder="pågående">
+        <input type="text" class="period-comment" data-namn="${esc(namn)}" data-idx="${i}" value="${esc(p.comment)}" placeholder="kommentar, t.ex. flyttat">
+        <button class="pill-btn" data-removeperiod="${esc(namn)}|${i}" title="Ta bort period">✕</button>
       </div>`).join('');
-    rowsHtml += `<button class="period-add" data-addperiod="${namn}">+ lägg till period</button>`;
-    tr.innerHTML = `<td>${namn}</td><td>${rowsHtml}</td>`;
+    rowsHtml += `<button class="period-add" data-addperiod="${esc(namn)}">+ lägg till period</button>`;
+    tr.innerHTML = `<td>${esc(namn)}</td><td>${rowsHtml}</td>`;
     tbody.appendChild(tr);
 
     tr.querySelectorAll('.period-from').forEach((inp,i)=>{
@@ -675,18 +718,19 @@ function runMatch(){
     });
   });
 
-  // group kundreskontralista by kundNr -> monthKey -> {debet, kredit, fakturanr: Set}
+  // group kundreskontralista by kundNr -> monthKey -> {debet, kredit}
+  // Fakturarader grupperas på FAKTURADATUM (fallback verifikationsdatum), så Fakturerat hamnar i
+  // fakturans månad även om den bokförts en annan dag; övriga rader på verifikationsdatum.
   const ledgerByKund = new Map();
   let skippedLedgerCount = 0;
   allReskontraRows().forEach(t=>{
     if(!t.kundNr) return;
     if(startReskontraKey && t.datum < startReskontraKey){ skippedLedgerCount++; return; }
-    const mk = monthKeyFromDate(t.datum);
+    const mk = monthKeyFromDate(rowMonthDate(t));
     if(!ledgerByKund.has(t.kundNr)) ledgerByKund.set(t.kundNr, new Map());
     const monthMap = ledgerByKund.get(t.kundNr);
-    const cur = monthMap.get(mk) || {debet:0, kredit:0, fakturanr:new Set()};
+    const cur = monthMap.get(mk) || {debet:0, kredit:0};
     cur.debet += t.debet; cur.kredit += t.kredit;
-    if(t.debet!==0 && effectiveFakturanr(t)) cur.fakturanr.add(effectiveFakturanr(t));
     monthMap.set(mk, cur);
   });
 
@@ -711,21 +755,30 @@ function runMatch(){
     // (t.ex. en betalning räknas men inte dess faktura).
     const custReskontraRows = allReskontraRows().filter(t=>
       t.kundNr===kundNr && !(startReskontraKey && t.datum < startReskontraKey));
-    const invoices = new Map(); // fakturanr -> {datum, belopp, typ}
+    // Flera debetrader med samma fakturanummer (t.ex. faktura + korrigering) summeras till EN
+    // faktura, så fakturavyn och Fakturerat alltid bygger på samma belopp.
+    const invoices = new Map(); // fakturanr -> {datum, belopp, rader}
     custReskontraRows.forEach(t=>{
-      if(t.debet!==0 && effectiveFakturanr(t)) invoices.set(effectiveFakturanr(t), {datum:t.datum, belopp:t.debet, typ:t.typ});
+      if(t.debet===0 || !t.fakturanr) return;
+      const d = rowMonthDate(t);
+      const cur = invoices.get(t.fakturanr);
+      if(!cur){ invoices.set(t.fakturanr, {datum:d, belopp:t.debet, rader:1}); return; }
+      cur.belopp += t.debet; cur.rader++;
+      if(d < cur.datum) cur.datum = d;
     });
     const paymentsByInvoice = new Map(); // fakturanr -> {paid, lastDatum}
-    const unmatchedPayments = []; // kredit-rader utan (auto eller manuellt) fakturanummer
+    // kredit-rader som inte kan kopplas till en faktura i perioden: saknar fakturanummer, eller
+    // pekar på ett nummer som inte finns bland kundens fakturor (före startdatum, feltolkat, annan kund)
+    const unmatchedPayments = [];
     custReskontraRows.forEach(t=>{
-      if(t.kredit>0){
-        const nr = effectiveFakturanr(t);
-        if(!nr){ unmatchedPayments.push(t); return; }
-        const cur = paymentsByInvoice.get(nr) || {paid:0, lastDatum:''};
-        cur.paid += t.kredit;
-        if(t.datum > cur.lastDatum) cur.lastDatum = t.datum;
-        paymentsByInvoice.set(nr, cur);
-      }
+      if(t.kredit<=0) return;
+      const nr = effectiveFakturanr(t);
+      if(!nr){ unmatchedPayments.push({t, reason:'Inget fakturanummer i beskrivningen'}); return; }
+      if(!invoices.has(nr)){ unmatchedPayments.push({t, reason:`Fakturanr ${nr} finns inte bland kundens fakturor i perioden`}); return; }
+      const cur = paymentsByInvoice.get(nr) || {paid:0, lastDatum:''};
+      cur.paid += t.kredit;
+      if(t.datum > cur.lastDatum) cur.lastDatum = t.datum;
+      paymentsByInvoice.set(nr, cur);
     });
     // kvittningar: positiv kvittningsrad = fakturan som regleras av en kredit,
     // negativ = kreditfakturan som förbrukas
@@ -739,6 +792,19 @@ function runMatch(){
         creditConsumed.set(t.fakturanr, (creditConsumed.get(t.fakturanr)||0) + (-t.kvittningsBelopp));
       }
     });
+    // reglerat belopp per faktura i fakturans eget tecken: betalt + kvittad kredit för en faktura,
+    // −förbrukat för en kreditfaktura. Rest = belopp − reglerat, för båda.
+    const settledFor = (nr, inv)=> inv.belopp < 0
+      ? -(creditConsumed.get(nr) || 0)
+      : (paymentsByInvoice.get(nr)?.paid || 0) + (creditAppliedByInvoice.get(nr) || 0);
+    // fakturor per månad (fakturans tidigaste fakturadatum) — varje faktura räknas i exakt en månad
+    const invoicesByMonth = new Map();
+    invoices.forEach((inv, nr)=>{
+      const mk = monthKeyFromDate(inv.datum);
+      if(!invoicesByMonth.has(mk)) invoicesByMonth.set(mk, []);
+      invoicesByMonth.get(mk).push(nr);
+      allMonths.add(mk);
+    });
 
     let custHtml = '';
     let hasDeviation = false;
@@ -747,15 +813,15 @@ function runMatch(){
 
     [...allMonths].sort().forEach(mk=>{
       const underlagSum = uMap.get(mk) || 0;
-      const led = lMap.get(mk) || {debet:0, kredit:0, fakturanr:new Set()};
-      const monthFakturanr = led.fakturanr ? [...led.fakturanr] : [];
+      const led = lMap.get(mk) || {debet:0, kredit:0};
+      const monthFakturanr = (invoicesByMonth.get(mk) || []).sort((a,b)=>a.localeCompare(b,'sv',{numeric:true}));
       const fakturanrList = monthFakturanr.join(', ');
       const diffUF = led.debet - underlagSum;
       custTotalUnderlag += underlagSum; custTotalDebet += led.debet;
 
-      // betalningsstatus för just de fakturor som utfärdades denna månad, matchat på fakturanummer
-      const monthPaid = monthFakturanr.reduce((s,nr)=>s + (paymentsByInvoice.get(nr)?.paid || 0), 0);
-      const monthUnpaid = led.debet - monthPaid;
+      // regleringsstatus för just de fakturor som utfärdades denna månad, matchat på fakturanummer
+      const monthBelopp = monthFakturanr.reduce((s,nr)=>s + invoices.get(nr).belopp, 0);
+      const monthSettled = monthFakturanr.reduce((s,nr)=>s + settledFor(nr, invoices.get(nr)), 0);
 
       const okUF = Math.abs(diffUF) < 1;
       const approveKey = `${kundNr}|${mk}`;
@@ -766,29 +832,26 @@ function runMatch(){
         ? '<span class="tag approved">Godkänd</span>'
         : (okUF ? '<span class="tag ok">Stämmer</span>' : `<span class="tag warn">Avviker ${diffUF>0?'+':''}${fmtNum(diffUF)}</span>`);
 
-      const statusBetalning = monthFakturanr.length===0 ? ''
-        : (Math.abs(monthUnpaid)<1 ? '<span class="tag ok">Betald</span>'
-          : (monthPaid>0 ? `<span class="tag pay-warn">Delvis, ${fmtNum(monthUnpaid)} kvar</span>`
-            : '<span class="tag warn">Obetald</span>'));
+      const statusBetalning = monthFakturanr.length===0 ? '' : settleStatusTag(monthBelopp, monthSettled);
 
       if(filterHideOkMonths && (okUF || approved)){ hiddenOkMonths++; return; }
 
-      monthRowsHtml += `<tr class="${rowClass}"><td>${mk||'—'}</td>
-        <td>${fakturanrList}</td>
+      monthRowsHtml += `<tr class="${rowClass}"><td>${esc(mk)||'—'}</td>
+        <td>${esc(fakturanrList)}</td>
         <td class="num">${fmtNum(underlagSum)}</td>
         <td class="num">${fmtNum(led.debet)}</td>
         <td class="num ${okUF||approved?'diff-zero':'diff-pos'}">${fmtNum(diffUF)}</td>
         <td>${statusUF}</td>
-        <td><input type="checkbox" class="approve-check" data-key="${approveKey}" ${approved?'checked':''}></td>
-        <td class="num">${fmtNum(monthPaid)}</td>
+        <td><input type="checkbox" class="approve-check" data-key="${esc(approveKey)}" ${approved?'checked':''}></td>
+        <td class="num">${monthFakturanr.length ? fmtNum(monthSettled) : ''}</td>
         <td>${statusBetalning}</td></tr>`;
     });
 
-    // Totalt-radens Betalt/Utestående räknas på samma fakturamatchade grund som varje rad ovan
+    // Totalt-radens Reglerat/Utestående räknas på samma fakturamatchade grund som varje rad ovan
     // (inte råa kalendermånadssummor), så de två går att jämföra rakt av.
-    let custTotalBetalt = 0;
-    invoices.forEach((inv, nr)=>{ custTotalBetalt += (paymentsByInvoice.get(nr)?.paid || 0); });
-    const utestaende = custTotalDebet - custTotalBetalt;
+    let custTotalReglerat = 0;
+    invoices.forEach((inv, nr)=>{ custTotalReglerat += settledFor(nr, inv); });
+    const utestaende = custTotalDebet - custTotalReglerat;
     const totalDiffUF = custTotalDebet - custTotalUnderlag;
     const hasOutstanding = Math.abs(utestaende) >= 1;
 
@@ -800,7 +863,7 @@ function runMatch(){
     custHtml += `<table style="margin-bottom:0;"><thead>
       <tr><th>Faktureringsmånad</th><th>Fakturanr</th><th class="num">Underlag</th><th class="num">Fakturerat</th>
       <th class="num">Diff U/F</th><th>Status U/F</th><th>Godkänd</th>
-      <th class="num">Betalt</th><th>Status betalning</th></tr></thead><tbody>`;
+      <th class="num" title="Inbetalningar + kvittade krediter, kopplade på fakturanummer">Reglerat</th><th>Status betalning</th></tr></thead><tbody>`;
     custHtml += monthRowsHtml;
     if(hiddenOkMonths){
       custHtml += `<tr><td colspan="9" class="small" style="font-style:italic;padding:8px 10px;">${hiddenOkMonths} månad(er) som stämmer är dolda av filtret.</td></tr>`;
@@ -810,7 +873,7 @@ function runMatch(){
       <td class="num">${fmtNum(custTotalDebet)}</td>
       <td class="num">${fmtNum(totalDiffUF)}</td>
       <td></td><td></td>
-      <td class="num">${fmtNum(custTotalBetalt)}</td>
+      <td class="num">${fmtNum(custTotalReglerat)}</td>
       <td>Utestående: ${fmtNum(utestaende)}</td></tr>`;
     custHtml += `</tbody></table>`;
 
@@ -825,47 +888,30 @@ function runMatch(){
       [...invoices.entries()].sort((a,b)=>a[1].datum.localeCompare(b[1].datum)).forEach(([nr, inv])=>{
         const pay = paymentsByInvoice.get(nr) || {paid:0, lastDatum:''};
         const credited = creditAppliedByInvoice.get(nr) || 0;
-        let status;
-        if(inv.typ==='kreditfaktura'){
-          const consumed = creditConsumed.get(nr) || 0;
-          status = Math.abs(consumed - (-inv.belopp)) < 1
-            ? '<span class="tag ok">Kvittad</span>'
-            : (consumed>0
-              ? `<span class="tag pay-warn">Delvis kvittad, ${fmtNum(-inv.belopp - consumed)} kvar</span>`
-              : '<span class="tag cross">Kreditfaktura (ej kvittad)</span>');
-          custHtml += `<tr><td>${nr}</td><td>${inv.datum}</td><td class="num">${fmtNum(inv.belopp)}</td>
-            <td class="num"></td><td class="num"></td><td></td><td>${status}</td></tr>`;
-          return;
-        }
-        const settled = pay.paid + credited;
-        const diff = inv.belopp - settled;
-        if(Math.abs(diff)<1){
-          status = credited>0 && pay.paid===0
-            ? '<span class="tag ok">Krediterad</span>'
-            : '<span class="tag ok">Betald</span>';
-        } else if(settled>0){
-          status = `<span class="tag pay-warn">Delvis, ${fmtNum(diff)} kvar</span>`;
-        } else {
-          status = '<span class="tag warn">Obetald</span>';
-        }
-        custHtml += `<tr><td>${nr}</td><td>${inv.datum}</td><td class="num">${fmtNum(inv.belopp)}</td>
-          <td class="num">${credited?fmtNum(credited):''}</td>
-          <td class="num">${fmtNum(pay.paid)}</td><td>${pay.lastDatum||''}</td><td>${status}</td></tr>`;
+        const isCredit = inv.belopp < 0;
+        const status = settleStatusTag(inv.belopp, settledFor(nr, inv), {creditOnly: !isCredit && credited>0 && pay.paid===0});
+        const raderNote = inv.rader>1 ? ` <span class="small">(${inv.rader} rader)</span>` : '';
+        custHtml += `<tr><td>${esc(nr)}${raderNote}</td><td>${esc(inv.datum)}</td><td class="num">${fmtNum(inv.belopp)}</td>
+          <td class="num">${isCredit ? fmtNum(creditConsumed.get(nr)||0) : (credited?fmtNum(credited):'')}</td>
+          <td class="num">${isCredit ? '' : fmtNum(pay.paid)}</td><td>${esc(pay.lastDatum)}</td><td>${status}</td></tr>`;
       });
       custHtml += `</tbody></table></details>`;
     }
 
-    // betalningar utan (auto-tolkat) fakturanummer — låt användaren koppla dem manuellt
+    // inbetalningar som inte kunnat kopplas till en faktura i perioden — låt användaren koppla manuellt
     if(unmatchedPayments.length){
-      const invoiceOptions = [...invoices.keys()].sort().map(nr=>`<option value="${nr}">${nr}</option>`).join('');
       custHtml += `<details class="excl-group" open><summary>
           <span class="excl-namn">Ej matchade betalningar</span>
-          <span class="excl-meta">${unmatchedPayments.length} st · beskrivningen saknar utläsbart fakturanummer — koppla manuellt</span>
+          <span class="excl-meta">${unmatchedPayments.length} st · räknas inte som reglerade — koppla manuellt, eller uteslut raden under "Alla transaktioner"</span>
         </summary>
-        <table><thead><tr><th>Vernr</th><th>Datum</th><th>Beskrivning</th><th class="num">Belopp</th><th>Koppla till faktura</th></tr></thead><tbody>`;
-      unmatchedPayments.sort((a,b)=>a.datum.localeCompare(b.datum)).forEach(t=>{
-        custHtml += `<tr><td>${t.vernr}</td><td>${t.datum}</td><td>${t.beskrivning}</td><td class="num">${fmtNum(t.kredit)}</td>
-          <td><select class="payment-override" data-vernr="${t.vernr}">
+        <table><thead><tr><th>Vernr</th><th>Datum</th><th>Beskrivning</th><th class="num">Belopp</th><th>Orsak</th><th>Koppla till faktura</th></tr></thead><tbody>`;
+      unmatchedPayments.sort((a,b)=>a.t.datum.localeCompare(b.t.datum)).forEach(({t, reason})=>{
+        const current = state.paymentOverrides[t.id] || '';
+        const invoiceOptions = [...invoices.keys()].sort((a,b)=>a.localeCompare(b,'sv',{numeric:true}))
+          .map(nr=>`<option value="${esc(nr)}" ${nr===current?'selected':''}>${esc(nr)}</option>`).join('');
+        custHtml += `<tr><td>${esc(t.vernr)}</td><td>${esc(t.datum)}</td><td>${esc(t.beskrivning)}</td><td class="num">${fmtNum(t.kredit)}</td>
+          <td class="small">${esc(reason)}</td>
+          <td><select class="payment-override" data-id="${esc(t.id)}">
             <option value="">— välj faktura —</option>
             ${invoiceOptions}
           </select></td></tr>`;
@@ -875,23 +921,43 @@ function runMatch(){
 
     // rå transaktionslogg — allt som lästs in för kunden, för granskning och möjlighet att
     // manuellt utesluta enskilda rader (t.ex. dubbelbokförda korrigeringsrader)
+    // Löpande saldo = ackumulerat (debet − kredit) i datumordning (vernr som tiebreak).
+    // Räknas bara på rader som ingår i avstämningen (ej uteslutna, ej före startdatum), så
+    // slutsaldot är direkt jämförbart med Fakturerat − alla inbetalningar för kunden.
+    // Kvittningsrader har debet=kredit=0 och lämnar saldot orört.
     const rawRowsForKund = allReskontraRowsRaw().filter(t=>t.kundNr===kundNr);
+    let slutsaldo = 0;
     if(rawRowsForKund.length){
+      let txHtml = '';
+      rawRowsForKund
+        .sort((a,b)=>a.datum.localeCompare(b.datum) || String(a.vernr).localeCompare(String(b.vernr), 'sv', {numeric:true}))
+        .forEach(t=>{
+          const excluded = !!state.excludedReskontraRows[t.id];
+          const beforeStart = !!(startReskontraKey && t.datum < startReskontraKey);
+          const inScope = !excluded && !beforeStart;
+          if(inScope) slutsaldo += t.debet - t.kredit;
+          const saldoCell = inScope ? fmtNum(slutsaldo) : '—';
+          const notes = [
+            t.note ? `<span class="tag cross">${esc(t.note)}</span>` : '',
+            beforeStart ? '<span class="tag unmapped">Före startdatum</span>' : ''
+          ].join('');
+          txHtml += `<tr class="${excluded?'excluded-row':(beforeStart?'muted-row':'')}">
+            <td><input type="checkbox" class="row-exclude" data-id="${esc(t.id)}" ${excluded?'checked':''}></td>
+            <td>${esc(t.vernr)}</td><td>${esc(t.datum)}</td><td>${esc(t.typ)}</td><td>${esc(t.beskrivning)}</td>
+            <td class="num">${fmtNum(t.debet)}</td><td class="num">${fmtNum(t.kredit)}</td>
+            <td class="num saldo">${saldoCell}</td>
+            <td>${esc(effectiveFakturanr(t))}</td>
+            <td>${notes}</td></tr>`;
+        });
       custHtml += `<details class="excl-group"><summary>
           <span class="excl-namn">Alla transaktioner (granska)</span>
-          <span class="excl-meta">${rawRowsForKund.length} rad(er) · kryssa för att utesluta en rad ur alla summeringar</span>
+          <span class="excl-meta">${rawRowsForKund.length} rad(er) · slutsaldo ${fmtNum(slutsaldo)} · kryssa för att utesluta en rad ur alla summeringar</span>
         </summary>
         <table><thead><tr><th>Uteslut</th><th>Vernr</th><th>Datum</th><th>Typ</th><th>Beskrivning</th>
-        <th class="num">Debet</th><th class="num">Kredit</th><th>Fakturanr</th><th>Anmärkning</th></tr></thead><tbody>`;
-      rawRowsForKund.sort((a,b)=>a.datum.localeCompare(b.datum)).forEach(t=>{
-        const excluded = !!state.excludedReskontraRows[t.id];
-        custHtml += `<tr class="${excluded?'excluded-row':''}">
-          <td><input type="checkbox" class="row-exclude" data-id="${t.id}" ${excluded?'checked':''}></td>
-          <td>${t.vernr}</td><td>${t.datum}</td><td>${t.typ}</td><td>${t.beskrivning}</td>
-          <td class="num">${fmtNum(t.debet)}</td><td class="num">${fmtNum(t.kredit)}</td><td>${effectiveFakturanr(t)}</td>
-          <td>${t.note ? `<span class="tag cross">${t.note}</span>` : ''}</td></tr>`;
-      });
-      custHtml += `</tbody></table></details>`;
+        <th class="num">Debet</th><th class="num">Kredit</th><th class="num">Saldo</th><th>Fakturanr</th><th>Anmärkning</th></tr></thead><tbody>
+        ${txHtml}
+        <tr class="group-head"><td colspan="7">Slutsaldo</td><td class="num saldo">${fmtNum(slutsaldo)}</td><td colspan="2"></td></tr>
+        </tbody></table></details>`;
     }
 // sammanfattande badges i rubriken + kollapsbar kundgrupp
     const ufBadge = Math.abs(totalDiffUF) < 1
@@ -900,10 +966,17 @@ function runMatch(){
     const utBadge = hasOutstanding
       ? `<span class="tag pay-warn">Utestående ${fmtNum(utestaende)}</span>`
       : '<span class="tag ok">Inget utestående</span>';
-    const openAttr = (hasDeviation || hasOutstanding) ? ' open' : '';
+    // Saldo (debet − ALLA inbetalningar) ska normalt vara lika med Utestående (debet − reglerat på
+    // fakturanummer). Skiljer de sig finns inbetalningar som inte kopplats till en faktura i perioden
+    // (se "Ej matchade betalningar") eller kvittningsrader som inte går jämnt ut.
+    const saldoMismatch = Math.abs(slutsaldo - utestaende) >= 1;
+    const saldoBadge = saldoMismatch
+      ? `<span class="tag warn" title="Slutsaldo i reskontran skiljer sig från Utestående — det finns inbetalningar som inte är kopplade till en faktura i perioden">Saldo ${fmtNum(slutsaldo)} ≠ utestående</span>`
+      : '';
+    const openAttr = (hasDeviation || hasOutstanding || saldoMismatch) ? ' open' : '';
     html += `<details class="excl-group kund-group"${openAttr}><summary>
-        <span class="excl-namn">Kund ${kundNr} — ${kundNamn}</span>
-        <span class="kund-badges">${ufBadge}${utBadge}</span>
+        <span class="excl-namn">Kund ${esc(kundNr)} — ${esc(kundNamn)}</span>
+        <span class="kund-badges">${ufBadge}${utBadge}${saldoBadge}</span>
       </summary><div style="padding:0 6px 10px;">${custHtml}</div></details>`;
   });
 
@@ -913,7 +986,7 @@ function runMatch(){
 
   if(unmapped.length){
     const names = [...new Set(unmapped.map(r=>r.namn))];
-    html += `<div class="small" style="margin-top:6px;"><span class="tag unmapped">Ej mappade</span> ${names.join(', ')} — gå till avsnitt 4 för att koppla dessa.</div>`;
+    html += `<div class="small" style="margin-top:6px;"><span class="tag unmapped">Ej mappade</span> ${esc(names.join(', '))} — gå till avsnitt 4 för att koppla dessa.</div>`;
   }
 
   if(excludedRows.length){
@@ -926,13 +999,13 @@ function runMatch(){
     [...byNamn.entries()].sort((a,b)=>a[0].localeCompare(b[0],'sv')).forEach(([namn, list])=>{
       const total = list.reduce((s,r)=>s+r.avgift,0);
       html += `<details class="excl-group"><summary>
-          <span class="excl-namn">${namn}</span>
+          <span class="excl-namn">${esc(namn)}</span>
           <span class="excl-meta">${list.length} rad(er) · ${fmtNum(total)} kr</span>
         </summary>
         <table><thead><tr><th>Månad</th><th class="num">Avgift</th><th>Kommentar</th></tr></thead><tbody>`;
       list.sort((a,b)=>(a.manad||'').localeCompare(b.manad||''));
       list.forEach(r=>{
-        html += `<tr><td>${monthKeyFromUnderlag(r.manad)}</td><td class="num">${fmtNum(r.avgift)}</td><td>${r.comment||''}</td></tr>`;
+        html += `<tr><td>${esc(monthKeyFromUnderlag(r.manad))}</td><td class="num">${fmtNum(r.avgift)}</td><td>${esc(r.comment)}</td></tr>`;
       });
       html += `</tbody></table></details>`;
     });
@@ -953,8 +1026,8 @@ function runMatch(){
   });
   reportEl.querySelectorAll('.payment-override').forEach(sel=>{
     sel.addEventListener('change', ()=>{
-      if(sel.value) state.paymentOverrides[sel.dataset.vernr] = sel.value;
-      else delete state.paymentOverrides[sel.dataset.vernr];
+      if(sel.value) state.paymentOverrides[sel.dataset.id] = sel.value;
+      else delete state.paymentOverrides[sel.dataset.id];
       runMatch();
     });
   });
@@ -994,6 +1067,7 @@ document.getElementById('import-state').addEventListener('change', e=>{
       state.manualIdentities = loaded.manualIdentities || {};
       state.birthYears = loaded.birthYears || {};
       state.paymentOverrides = loaded.paymentOverrides || {};
+      migratePaymentOverrides();
       state.excludedReskontraRows = loaded.excludedReskontraRows || {};
       state.mapping = loaded.mapping || {};
       state.exclusions = loaded.exclusions || {};

@@ -12,6 +12,7 @@ Live: https://kristofer84.github.io/ber-spiris/
 - Markera perioder där en person inte ska faktureras
 - Automatisk åldersfärgkodning baserat på personnummer i underlaget
 - Avstämning per kund och månad: underlag vs. fakturerat, samt betalningsstatus per faktura
+- Transaktionslogg per kund med löpande saldo; varnar när slutsaldot inte stämmer med utestående (ej kopplade inbetalningar)
 - Exportera/importera hela arbetstillståndet som JSON för att spara mellan sessioner
 
 ## Struktur
