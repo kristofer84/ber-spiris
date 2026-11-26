@@ -263,6 +263,10 @@ function effectiveFakturanr(t){
   return t.fakturanr;
 }
 // datum som avgör vilken månad en rad hör till: fakturadatum för fakturarader, annars verifikationsdatum
+function todayIso(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 function rowMonthDate(t){
   return (t.debet!==0 && t.fakturadatum) ? t.fakturadatum : t.datum;
 }
@@ -668,7 +672,7 @@ function findExclusionForRow(row){
 
 // ---------- matching / report ----------
 document.getElementById('run-match').addEventListener('click', runMatch);
-['filter-deviations','filter-outstanding','filter-hide-ok-months'].forEach(id=>{
+['filter-deviations','filter-outstanding','filter-hide-not-due','filter-hide-ok-months'].forEach(id=>{
   document.getElementById(id).addEventListener('change', ()=>{
     // kör bara om ifall en rapport redan visas
     if(document.getElementById('report').innerHTML.trim()) runMatch();
@@ -681,6 +685,8 @@ function runMatch(){
   state.startReskontra = document.getElementById('start-reskontra').value.trim();
   const filterDeviations = document.getElementById('filter-deviations').checked;
   const filterOutstanding = document.getElementById('filter-outstanding').checked;
+  const filterHideNotDue = document.getElementById('filter-hide-not-due').checked;
+  const idag = todayIso();
   const filterHideOkMonths = document.getElementById('filter-hide-ok-months').checked;
   let shownKunder = 0;
   const startUnderlagKey = state.startUnderlag ? monthKeyFromUnderlag(state.startUnderlag) : null;
@@ -757,14 +763,15 @@ function runMatch(){
       t.kundNr===kundNr && !(startReskontraKey && t.datum < startReskontraKey));
     // Flera debetrader med samma fakturanummer (t.ex. faktura + korrigering) summeras till EN
     // faktura, så fakturavyn och Fakturerat alltid bygger på samma belopp.
-    const invoices = new Map(); // fakturanr -> {datum, belopp, rader}
+    const invoices = new Map(); // fakturanr -> {datum, forfallodatum, belopp, rader}
     custReskontraRows.forEach(t=>{
       if(t.debet===0 || !t.fakturanr) return;
       const d = rowMonthDate(t);
       const cur = invoices.get(t.fakturanr);
-      if(!cur){ invoices.set(t.fakturanr, {datum:d, belopp:t.debet, rader:1}); return; }
+      if(!cur){ invoices.set(t.fakturanr, {datum:d, forfallodatum:t.forfallodatum||'', belopp:t.debet, rader:1}); return; }
       cur.belopp += t.debet; cur.rader++;
       if(d < cur.datum) cur.datum = d;
+      if((t.forfallodatum||'') > cur.forfallodatum) cur.forfallodatum = t.forfallodatum;
     });
     const paymentsByInvoice = new Map(); // fakturanr -> {paid, lastDatum}
     // kredit-rader som inte kan kopplas till en faktura i perioden: saknar fakturanummer, eller
@@ -810,6 +817,8 @@ function runMatch(){
     let hasDeviation = false;
     let hiddenOkMonths = 0;
     let monthRowsHtml = '';
+    // löpande summor räknas över ALLA månader, även de som döljs av "Dölj månader som stämmer"
+    let runDiffUF = 0, runSaldo = 0;
 
     [...allMonths].sort().forEach(mk=>{
       const underlagSum = uMap.get(mk) || 0;
@@ -833,6 +842,8 @@ function runMatch(){
         : (okUF ? '<span class="tag ok">Stämmer</span>' : `<span class="tag warn">Avviker ${diffUF>0?'+':''}${fmtNum(diffUF)}</span>`);
 
       const statusBetalning = monthFakturanr.length===0 ? '' : settleStatusTag(monthBelopp, monthSettled);
+      runDiffUF += diffUF;
+      runSaldo += led.debet - monthSettled; // fakturerat − reglerat; slutar på Utestående
 
       if(filterHideOkMonths && (okUF || approved)){ hiddenOkMonths++; return; }
 
@@ -841,9 +852,11 @@ function runMatch(){
         <td class="num">${fmtNum(underlagSum)}</td>
         <td class="num">${fmtNum(led.debet)}</td>
         <td class="num ${okUF||approved?'diff-zero':'diff-pos'}">${fmtNum(diffUF)}</td>
+        <td class="num saldo">${fmtNum(runDiffUF)}</td>
         <td>${statusUF}</td>
         <td><input type="checkbox" class="approve-check" data-key="${esc(approveKey)}" ${approved?'checked':''}></td>
         <td class="num">${monthFakturanr.length ? fmtNum(monthSettled) : ''}</td>
+        <td class="num saldo">${fmtNum(runSaldo)}</td>
         <td>${statusBetalning}</td></tr>`;
     });
 
@@ -854,27 +867,40 @@ function runMatch(){
     const utestaende = custTotalDebet - custTotalReglerat;
     const totalDiffUF = custTotalDebet - custTotalUnderlag;
     const hasOutstanding = Math.abs(utestaende) >= 1;
+    // kvarvarande belopp på fakturor som ännu inte förfallit (förfallodatum idag eller senare)
+    let ejForfallet = 0;
+    invoices.forEach((inv, nr)=>{
+      const rest = inv.belopp - settledFor(nr, inv);
+      if(inv.belopp > 0 && rest > 0 && inv.forfallodatum && inv.forfallodatum >= idag) ejForfallet += rest;
+    });
+    const forfallet = utestaende - ejForfallet;
+    // inget förfallet att jaga: allt utestående (även 0) är ej förfallna fakturor
+    const onlyNotDue = Math.abs(forfallet) < 1;
 
     // globala filter — hoppa hela kunden om den inte matchar
     if(filterDeviations && !hasDeviation) return;
     if(filterOutstanding && !hasOutstanding) return;
+    if(filterHideNotDue && onlyNotDue) return;
     shownKunder++;
 
     custHtml += `<table style="margin-bottom:0;"><thead>
       <tr><th>Faktureringsmånad</th><th>Fakturanr</th><th class="num">Underlag</th><th class="num">Fakturerat</th>
-      <th class="num">Diff U/F</th><th>Status U/F</th><th>Godkänd</th>
-      <th class="num" title="Inbetalningar + kvittade krediter, kopplade på fakturanummer">Reglerat</th><th>Status betalning</th></tr></thead><tbody>`;
+      <th class="num">Diff U/F</th><th class="num" title="Ackumulerad Diff U/F t.o.m. månaden">Löpande diff U/F</th><th>Status U/F</th><th>Godkänd</th>
+      <th class="num" title="Inbetalningar + kvittade krediter, kopplade på fakturanummer">Reglerat</th>
+      <th class="num" title="Ackumulerat Fakturerat − Reglerat t.o.m. månaden">Löpande saldo</th><th>Status betalning</th></tr></thead><tbody>`;
     custHtml += monthRowsHtml;
     if(hiddenOkMonths){
-      custHtml += `<tr><td colspan="9" class="small" style="font-style:italic;padding:8px 10px;">${hiddenOkMonths} månad(er) som stämmer är dolda av filtret.</td></tr>`;
+      custHtml += `<tr><td colspan="11" class="small" style="font-style:italic;padding:8px 10px;">${hiddenOkMonths} månad(er) som stämmer är dolda av filtret.</td></tr>`;
     }
     custHtml += `<tr class="group-head"><td>Totalt</td><td></td>
       <td class="num">${fmtNum(custTotalUnderlag)}</td>
       <td class="num">${fmtNum(custTotalDebet)}</td>
       <td class="num">${fmtNum(totalDiffUF)}</td>
+      <td class="num saldo">${fmtNum(totalDiffUF)}</td>
       <td></td><td></td>
       <td class="num">${fmtNum(custTotalReglerat)}</td>
-      <td>Utestående: ${fmtNum(utestaende)}</td></tr>`;
+      <td class="num saldo">${fmtNum(utestaende)}</td>
+      <td>Utestående: ${fmtNum(utestaende)}${ejForfallet>=1 ? `<br><span class="small">varav ej förfallet ${fmtNum(ejForfallet)}</span>` : ''}</td></tr>`;
     custHtml += `</tbody></table>`;
 
     // detaljerad per-faktura-vy (samma underliggande matchning, en rad per faktura)
@@ -883,7 +909,7 @@ function runMatch(){
           <span class="excl-namn">Fakturor per faktura</span>
           <span class="excl-meta">${invoices.size} st · exakt regleringsstatus (betalningar + kvittade krediter) oberoende av kalendermånad</span>
         </summary>
-        <table><thead><tr><th>Fakturanr</th><th>Fakturadatum</th><th class="num">Belopp</th>
+        <table><thead><tr><th>Fakturanr</th><th>Fakturadatum</th><th>Förfallodatum</th><th class="num">Belopp</th>
         <th class="num">Krediterat</th><th class="num">Betalt</th><th>Betaldatum</th><th>Status</th></tr></thead><tbody>`;
       [...invoices.entries()].sort((a,b)=>a[1].datum.localeCompare(b[1].datum)).forEach(([nr, inv])=>{
         const pay = paymentsByInvoice.get(nr) || {paid:0, lastDatum:''};
@@ -891,7 +917,7 @@ function runMatch(){
         const isCredit = inv.belopp < 0;
         const status = settleStatusTag(inv.belopp, settledFor(nr, inv), {creditOnly: !isCredit && credited>0 && pay.paid===0});
         const raderNote = inv.rader>1 ? ` <span class="small">(${inv.rader} rader)</span>` : '';
-        custHtml += `<tr><td>${esc(nr)}${raderNote}</td><td>${esc(inv.datum)}</td><td class="num">${fmtNum(inv.belopp)}</td>
+        custHtml += `<tr><td>${esc(nr)}${raderNote}</td><td>${esc(inv.datum)}</td><td>${esc(inv.forfallodatum)}</td><td class="num">${fmtNum(inv.belopp)}</td>
           <td class="num">${isCredit ? fmtNum(creditConsumed.get(nr)||0) : (credited?fmtNum(credited):'')}</td>
           <td class="num">${isCredit ? '' : fmtNum(pay.paid)}</td><td>${esc(pay.lastDatum)}</td><td>${status}</td></tr>`;
       });
@@ -964,7 +990,9 @@ function runMatch(){
       ? (hasDeviation ? '<span class="tag warn">Månadsavvikelser</span>' : '<span class="tag ok">U/F stämmer</span>')
       : `<span class="tag warn">Diff U/F ${totalDiffUF>0?'+':''}${fmtNum(totalDiffUF)}</span>`;
     const utBadge = hasOutstanding
-      ? `<span class="tag pay-warn">Utestående ${fmtNum(utestaende)}</span>`
+      ? (onlyNotDue
+        ? `<span class="tag approved">Utestående ${fmtNum(utestaende)}, ej förfallet</span>`
+        : `<span class="tag pay-warn">Utestående ${fmtNum(utestaende)}${ejForfallet>=1 ? ` (förfallet ${fmtNum(forfallet)})` : ''}</span>`)
       : '<span class="tag ok">Inget utestående</span>';
     // Saldo (debet − ALLA inbetalningar) ska normalt vara lika med Utestående (debet − reglerat på
     // fakturanummer). Skiljer de sig finns inbetalningar som inte kopplats till en faktura i perioden
@@ -973,7 +1001,7 @@ function runMatch(){
     const saldoBadge = saldoMismatch
       ? `<span class="tag warn" title="Slutsaldo i reskontran skiljer sig från Utestående — det finns inbetalningar som inte är kopplade till en faktura i perioden">Saldo ${fmtNum(slutsaldo)} ≠ utestående</span>`
       : '';
-    const openAttr = (hasDeviation || hasOutstanding || saldoMismatch) ? ' open' : '';
+    const openAttr = (hasDeviation || (hasOutstanding && !onlyNotDue) || saldoMismatch) ? ' open' : '';
     html += `<details class="excl-group kund-group"${openAttr}><summary>
         <span class="excl-namn">Kund ${esc(kundNr)} — ${esc(kundNamn)}</span>
         <span class="kund-badges">${ufBadge}${utBadge}${saldoBadge}</span>
