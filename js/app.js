@@ -14,6 +14,10 @@ function parseSwedishNumber(s){
 function esc(v){
   return String(v ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+// med tecken: +1 547,00 / −1 547,00 / 0,00 — för diff-kolumner där riktningen spelar roll
+function fmtSigned(n){
+  return (n >= 0.005 ? '+' : '') + fmtNum(n);
+}
 function fmtNum(n){
   return n.toLocaleString('sv-SE', {minimumFractionDigits:2, maximumFractionDigits:2});
 }
@@ -955,26 +959,6 @@ function runMatch(){
     });
   }
   const isPreStartInvoice = key=>preStartInvoices.has(key) && !inPeriodInvoices.has(key);
-  // Kreditfakturor inom perioden som kvittas mot en faktura före startdatum hör också till den gamla
-  // perioden (annars blir saldot negativt). Kvittningsparet (kredit −X, faktura +X) har inte samma
-  // vernr, men samma kund, datum och belopp — para ihop dem på det.
-  const prePeriodCredits = new Set(); // `${kundNr}|${kreditens fakturanr}`
-  if(startReskontraKey){
-    const groups = new Map(); // `${kundNr}|${datum}|${|belopp|}` -> {pos:[nr], neg:[nr]}
-    allReskontraRows().forEach(t=>{
-      if(t.typ!=='kvittning' || !t.fakturanr || !t.kvittningsBelopp || isBeforeStart(t)) return;
-      const gk = `${t.kundNr}|${t.datum}|${Math.abs(t.kvittningsBelopp).toFixed(2)}`;
-      const g = groups.get(gk) || {pos:[], neg:[]};
-      (t.kvittningsBelopp > 0 ? g.pos : g.neg).push(t.fakturanr);
-      groups.set(gk, g);
-    });
-    groups.forEach((g, gk)=>{
-      const kundNr = gk.split('|')[0];
-      if(g.pos.length && g.pos.every(nr=>isPreStartInvoice(`${kundNr}|${nr}`))){
-        g.neg.forEach(nr=>prePeriodCredits.add(`${kundNr}|${nr}`));
-      }
-    });
-  }
   // null = ingår i avstämningen, annars orsak till att raden ligger utanför perioden
   const outOfPeriod = t=>{
     if(!startReskontraKey) return null;
@@ -984,21 +968,15 @@ function runMatch(){
       const key = `${t.kundNr}|${effectiveFakturanr(t)}`;
       if(isPreStartInvoice(key)) return 'prePeriodInvoice';
     }
-    if(t.fakturanr && (t.debet<0 || t.typ==='kvittning')){
-      const key = `${t.kundNr}|${t.fakturanr}`;
-      if(prePeriodCredits.has(key)) return 'prePeriodCredit';
-      if(t.typ==='kvittning' && isPreStartInvoice(key)) return 'prePeriodCredit'; // mottagande sidan
-    }
     return null;
   };
 
   const ledgerByKund = new Map();
-  let skippedLedgerCount = 0, skippedLatePayments = 0, skippedLateCredits = 0;
+  let skippedLedgerCount = 0, skippedLatePayments = 0;
   allReskontraRows().forEach(t=>{
     if(!t.kundNr) return;
     const oop = outOfPeriod(t);
     if(oop==='before'){ skippedLedgerCount++; return; }
-    if(oop==='prePeriodCredit'){ if(t.typ!=='kvittning') skippedLateCredits++; return; }
     if(oop){ skippedLatePayments++; return; }
     const mk = effMonth(t);
     if(!ledgerByKund.has(t.kundNr)) ledgerByKund.set(t.kundNr, new Map());
@@ -1158,8 +1136,8 @@ function runMatch(){
         <td>${esc(fakturanrList)}</td>
         <td class="num">${fmtNum(underlagSum)}</td>
         <td class="num">${fmtNum(led.debet)}</td>
-        <td class="num ${isDeviation?'diff-pos':'diff-zero'}">${fmtNum(diffUF)}</td>
-        <td class="num saldo">${fmtNum(runDiffUF)}</td>
+        <td class="num ${isDeviation?'diff-pos':'diff-zero'}">${fmtSigned(diffUF)}</td>
+        <td class="num saldo">${fmtSigned(runDiffUF)}</td>
         <td>${statusUF}</td>
         <td><input type="checkbox" class="approve-check" data-key="${esc(approveKey)}" ${approved?'checked':''}></td>
         <td class="num">${monthFakturanr.length ? fmtNum(monthSettled) : ''}</td>
@@ -1202,8 +1180,8 @@ function runMatch(){
     custHtml += `<tr class="group-head"><td>Totalt</td><td></td>
       <td class="num">${fmtNum(custTotalUnderlag)}</td>
       <td class="num">${fmtNum(custTotalDebet)}</td>
-      <td class="num">${fmtNum(totalDiffUF)}</td>
-      <td class="num saldo">${fmtNum(totalDiffUF)}</td>
+      <td class="num">${fmtSigned(totalDiffUF)}</td>
+      <td class="num saldo">${fmtSigned(totalDiffUF)}</td>
       <td></td><td></td>
       <td class="num">${fmtNum(custTotalReglerat)}</td>
       <td class="num saldo">${fmtNum(utestaende)}</td>
@@ -1254,21 +1232,24 @@ function runMatch(){
 
     // rå transaktionslogg — allt som lästs in för kunden, för granskning och möjlighet att
     // manuellt utesluta enskilda rader (t.ex. dubbelbokförda korrigeringsrader)
-    // Löpande saldo = ackumulerat (debet − kredit) i datumordning (vernr som tiebreak).
-    // Räknas bara på rader som ingår i avstämningen (ej uteslutna, ej före startdatum), så
-    // slutsaldot är direkt jämförbart med Fakturerat − alla inbetalningar för kunden.
-    // Kvittningsrader har debet=kredit=0 och lämnar saldot orört.
-    const rawRowsForKund = allReskontraRowsRaw().filter(t=>t.kundNr===kundNr);
-    let slutsaldo = 0;
+    // Löpande saldo = ingående saldo + ackumulerat (debet − kredit) i datumordning (vernr som tiebreak).
+    // Ingående saldo = alla (ej uteslutna) rader före startdatum, dvs. det som var öppet när perioden
+    // började. Sena betalningar av gamla fakturor räknas mot det, så slutsaldot går att jämföra rakt av
+    // med Utestående. Kvittningsrader har debet=kredit=0 och lämnar saldot orört.
+    const rawRowsForKund = allReskontraRowsRaw().filter(t=>t.kundNr===kundNr)
+      .sort((a,b)=>a.datum.localeCompare(b.datum) || String(a.vernr).localeCompare(String(b.vernr), 'sv', {numeric:true}));
+    const ingaendeSaldo = rawRowsForKund.reduce((s,t)=>
+      (!state.excludedReskontraRows[t.id] && outOfPeriod(t)==='before') ? s + t.debet - t.kredit : s, 0);
+    let slutsaldo = ingaendeSaldo;
     if(rawRowsForKund.length){
-      let txHtml = '';
-      rawRowsForKund
-        .sort((a,b)=>a.datum.localeCompare(b.datum) || String(a.vernr).localeCompare(String(b.vernr), 'sv', {numeric:true}))
-        .forEach(t=>{
+      let txHtml = startReskontraKey
+        ? `<tr class="group-head"><td colspan="8">Ingående saldo ${esc(startReskontraKey)} <span class="small">(rader före startdatum)</span></td><td class="num saldo">${fmtNum(ingaendeSaldo)}</td><td colspan="2"></td></tr>`
+        : '';
+      rawRowsForKund.forEach(t=>{
           const excluded = !!state.excludedReskontraRows[t.id];
           const oop = outOfPeriod(t);
-          const beforeStart = !!oop;
-          const inScope = !excluded && !beforeStart;
+          const beforeStart = oop==='before';
+          const inScope = !excluded && !beforeStart; // sena betalningar ingår i saldot
           if(inScope) slutsaldo += t.debet - t.kredit;
           const saldoCell = inScope ? fmtNum(slutsaldo) : '—';
           const nat = naturalMonth(t);
@@ -1277,10 +1258,9 @@ function runMatch(){
             ov ? `<span class="tag shift">Flyttad från ${esc(nat)}</span>` : '',
             t.note ? `<span class="tag cross">${esc(t.note)}</span>` : '',
             oop==='before' ? '<span class="tag unmapped">Före startdatum</span>' : '',
-            oop==='prePeriodInvoice' ? '<span class="tag unmapped">Betalar faktura före startdatum</span>' : '',
-            oop==='prePeriodCredit' ? '<span class="tag unmapped">Krediterar faktura före startdatum</span>' : ''
+            oop==='prePeriodInvoice' ? '<span class="tag unmapped">Betalar faktura före startdatum</span>' : ''
           ].join('');
-          txHtml += `<tr class="${excluded?'excluded-row':(beforeStart?'muted-row':'')}">
+          txHtml += `<tr class="${excluded?'excluded-row':(oop?'muted-row':'')}">
             <td><input type="checkbox" class="row-exclude" data-id="${esc(t.id)}" ${excluded?'checked':''}></td>
             <td>${esc(t.vernr)}</td><td>${esc(t.datum)}</td>
             <td><input type="text" class="row-month" data-id="${esc(t.id)}" data-natural="${esc(nat)}" value="${esc(ov)}" placeholder="${esc(nat)}" title="Månad raden räknas i. Skriv en annan månad (ÅÅÅÅ-MM) om raden hamnat i fel period; töm för att återställa."></td>
@@ -1311,12 +1291,13 @@ function runMatch(){
         ? `<span class="tag approved">Utestående ${fmtNum(utestaende)}, ej förfallet</span>`
         : `<span class="tag pay-warn">Utestående ${fmtNum(utestaende)}${ejForfallet>=1 ? ` (förfallet ${fmtNum(forfallet)})` : ''}</span>`)
       : '<span class="tag ok">Inget utestående</span>';
-    // Saldo (debet − ALLA inbetalningar) ska normalt vara lika med Utestående (debet − reglerat på
-    // fakturanummer). Skiljer de sig finns inbetalningar som inte kopplats till en faktura i perioden
-    // (se "Ej matchade betalningar") eller kvittningsrader som inte går jämnt ut.
+    // Saldo (ingående saldo + debet − ALLA inbetalningar) ska normalt vara lika med Utestående (debet −
+    // reglerat på fakturanummer). Skiljer de sig finns en gammal öppen post från före startdatum,
+    // inbetalningar som inte kopplats till en faktura (se "Ej matchade betalningar") eller kvittningar
+    // som inte går jämnt ut.
     const saldoMismatch = Math.abs(slutsaldo - utestaende) >= 1;
     const saldoBadge = saldoMismatch
-      ? `<span class="tag warn" title="Slutsaldo i reskontran skiljer sig från Utestående — det finns inbetalningar som inte är kopplade till en faktura i perioden">Saldo ${fmtNum(slutsaldo)} ≠ utestående</span>`
+      ? `<span class="tag warn" title="Slutsaldo i reskontran (inkl. ingående saldo) skiljer sig från Utestående i perioden. Vanliga orsaker: en faktura från före startdatum som fortfarande är (delvis) obetald, eller inbetalningar som inte är kopplade till en faktura — se Alla transaktioner / Ej matchade betalningar.">Saldo ${fmtNum(slutsaldo)} ≠ utestående ${fmtNum(utestaende)}</span>`
       : '';
     const openAttr = (hasDeviation || (hasOutstanding && !onlyNotDue) || saldoMismatch) ? ' open' : '';
     html += `<details class="excl-group kund-group"${openAttr}><summary>
@@ -1380,8 +1361,8 @@ function runMatch(){
     html += `</div>`;
   }
 
-  if(skippedUnderlagCount || skippedLedgerCount || skippedLatePayments || skippedLateCredits){
-    html += `<div class="small" style="margin-top:10px;">Ignorerat pga startdatum: ${skippedUnderlagCount} underlagsrad(er), ${skippedLedgerCount} reskontratransaktion(er)${skippedLatePayments ? `, ${skippedLatePayments} inbetalning(ar) av fakturor före startdatum` : ''}${skippedLateCredits ? `, ${skippedLateCredits} kreditfaktura(or) mot fakturor före startdatum` : ''}.</div>`;
+  if(skippedUnderlagCount || skippedLedgerCount || skippedLatePayments){
+    html += `<div class="small" style="margin-top:10px;">Ignorerat pga startdatum: ${skippedUnderlagCount} underlagsrad(er), ${skippedLedgerCount} reskontratransaktion(er)${skippedLatePayments ? `, ${skippedLatePayments} inbetalning(ar) av fakturor före startdatum` : ''}.</div>`;
   }
 
   reportEl.innerHTML = html;
