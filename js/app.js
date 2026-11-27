@@ -133,7 +133,7 @@ function parseReskontraCsv(text){
     if(cells[0] === 'Verifikationsnummer') continue; // column header line, repeats per customer block
     if(!cells[0]) continue; // pre-customer summary lines etc.
     if(!currentKundNr) continue; // stray line before any customer block
-    const [vernr, verdatum, beskrivning, fakturanummerKolumn, fakturadatum, forfallodatum, beloppRaw] = cells;
+    const [vernr, verdatum, beskrivning, fakturanummerKolumn, fakturadatum, forfallodatum, beloppRaw, ingBalRaw] = cells;
     if(!verdatum) continue;
     const belopp = parseSwedishNumber((beloppRaw||'').replace(/SEK/gi,''));
     // matchning sker alltid mot den sista siffergruppen i beskrivningstexten (t.ex. "...Nilsson  2954" -> 2954),
@@ -162,7 +162,8 @@ function parseReskontraCsv(text){
       typ = 'kreditfaktura'; debet = belopp; // behåller sitt (negativa) tecken
     } else if(beskrLower.includes('kundfaktura')){
       typ = 'kundfaktura'; debet = belopp;
-    } else if(beskrLower.includes('inbetalning')){
+    } else if(beskrLower.includes('inbetalning') || /(^|[^\p{L}]|slut|del)betalning/u.test(beskrLower)){
+      // Inbetalning, Betalning, Slutbetalning, Delbetalning — men inte Utbetalning/Återbetalning
       typ = 'inbetalning'; kredit = -belopp;
     } else {
       // okänd radtyp — fall tillbaka på teckenbaserad gissning
@@ -170,8 +171,14 @@ function parseReskontraCsv(text){
       kredit = belopp<0 ? -belopp : 0;
     }
 
+    // "Ingående balans" på en fakturarad = det som var öppet på fakturan när listan började. Är det
+    // mindre än fakturabeloppet har resten betalats före listans period (betalningen finns inte som rad).
+    let tidigareBetalt = 0;
+    const ingBal = (ingBalRaw||'').trim() ? parseSwedishNumber(ingBalRaw.replace(/SEK/gi,'')) : null;
+    if(ingBal !== null && debet > 0 && ingBal > 0 && ingBal < debet - 0.005) tidigareBetalt = debet - ingBal;
+
     out.push({
-      id: sig,
+      id: sig, tidigareBetalt, ingaendeBalans: ingBal,
       kundNr: currentKundNr, kundNamn: currentKundNamn,
       vernr, datum: verdatum, beskrivning, typ, note, kvittningsBelopp,
       fakturanr, fakturadatum: fakturadatum||'', forfallodatum: forfallodatum||'',
@@ -1042,6 +1049,13 @@ function runMatch(){
       if(t.datum > cur.lastDatum) cur.lastDatum = t.datum;
       paymentsByInvoice.set(nr, cur);
     });
+    // delbetalningar före listans start (ingående balans < fakturabelopp) räknas som betalt på fakturan
+    custReskontraRows.forEach(t=>{
+      if(!(t.tidigareBetalt > 0) || !t.fakturanr || !invoices.has(t.fakturanr)) return;
+      const cur = paymentsByInvoice.get(t.fakturanr) || {paid:0, lastDatum:''};
+      cur.paid += t.tidigareBetalt;
+      paymentsByInvoice.set(t.fakturanr, cur);
+    });
     // kvittningar: positiv kvittningsrad = fakturan som regleras av en kredit,
     // negativ = kreditfakturan som förbrukas
     const creditAppliedByInvoice = new Map(); // fakturanr -> summa krediterat
@@ -1251,7 +1265,7 @@ function runMatch(){
     const rawRowsForKund = allReskontraRowsRaw().filter(t=>t.kundNr===kundNr)
       .sort((a,b)=>a.datum.localeCompare(b.datum) || String(a.vernr).localeCompare(String(b.vernr), 'sv', {numeric:true}));
     const ingaendeSaldo = rawRowsForKund.reduce((s,t)=>
-      (!state.excludedReskontraRows[t.id] && outOfPeriod(t)==='before') ? s + t.debet - t.kredit : s, 0);
+      (!state.excludedReskontraRows[t.id] && outOfPeriod(t)==='before') ? s + t.debet - t.kredit - (t.tidigareBetalt||0) : s, 0);
     let slutsaldo = ingaendeSaldo;
     const txDebug = [];
     if(rawRowsForKund.length){
@@ -1263,19 +1277,20 @@ function runMatch(){
           const oop = outOfPeriod(t);
           const beforeStart = oop==='before';
           const inScope = !excluded && !beforeStart; // sena betalningar ingår i saldot
-          if(inScope) slutsaldo += t.debet - t.kredit;
+          if(inScope) slutsaldo += t.debet - t.kredit - (t.tidigareBetalt||0);
           const saldoCell = inScope ? fmtNum(slutsaldo) : '—';
           const nat = naturalMonth(t);
           const ov = state.rowMonthOverrides[t.id] || '';
           txDebug.push({vernr: t.vernr, datum: t.datum, fakturadatum: t.fakturadatum || '', forfallodatum: t.forfallodatum || '',
             typ: t.typ, beskrivning: t.beskrivning, debet: t.debet, kredit: t.kredit,
-            kvittningsBelopp: t.kvittningsBelopp, fakturanr: t.fakturanr || '', kopplatFakturanr: state.paymentOverrides[t.id] || '',
+            kvittningsBelopp: t.kvittningsBelopp, ingaendeBalans: t.ingaendeBalans ?? null, tidigareBetalt: t.tidigareBetalt || 0, fakturanr: t.fakturanr || '', kopplatFakturanr: state.paymentOverrides[t.id] || '',
             naturligManad: nat, flyttadTill: ov, utesluten: excluded,
             utanforPeriod: oop==='before' ? 'före startdatum' : (oop==='prePeriodInvoice' ? 'betalar faktura före startdatum' : ''),
             saldo: inScope ? slutsaldo : null, anmarkning: t.note || ''});
           const notes = [
             ov ? `<span class="tag shift">Flyttad från ${esc(nat)}</span>` : '',
             t.note ? `<span class="tag cross">${esc(t.note)}</span>` : '',
+            t.tidigareBetalt > 0 ? `<span class="tag approved" title="Ingående balans ${esc(fmtNum(t.ingaendeBalans))} i reskontralistan — resten betalades före listans period och räknas av i saldot">Delbetald före listan ${fmtNum(t.tidigareBetalt)}</span>` : '',
             oop==='before' ? '<span class="tag unmapped">Före startdatum</span>' : '',
             oop==='prePeriodInvoice' ? '<span class="tag unmapped">Betalar faktura före startdatum</span>' : ''
           ].join('');
@@ -1453,7 +1468,7 @@ function runMatch(){
 // står bara kända ord och siffror kvar. Mottagare, födelseår och fritexter tas inte med.
 const stripTags = h=>String(h || '').replace(/<[^>]+>/g, '').trim();
 const ANON_DESC_VOCAB = new Set(['kundfaktura','kreditfaktura','inbetalning','till','från','faktura','fakturanr',
-  'betalning','kvittning','avgift','ränta','dröjsmålsränta','påminnelse','påminnelseavgift','ocr','nr','bg','pg',
+  'betalning','slutbetalning','delbetalning','kvittning','avgift','ränta','dröjsmålsränta','påminnelse','påminnelseavgift','ocr','nr','bg','pg',
   'bankgiro','plusgiro','swish','autogiro','återbetalning','utbetalning','korrigering','kredit','debet','omföring',
   'sek','kr','och','av','för','avser','ref']);
 
@@ -1463,8 +1478,15 @@ function exportKundDebug(kundNr){
   const kundLabel = `Kund ${kundNr}`;
   const label = new Map(d.mappadeNamn.map((m, i)=>[m.namn, `Person ${i+1}`]));
   const person = n=>label.get(n) || 'Person ?';
-  // beskrivning: ord som inte är kända ord eller siffror -> kundetiketten ("Kundfaktura till 10001 Kund 10001 2993")
-  const desc = s=>(s || '').replace(/\p{L}[\p{L}\p{N}_-]*(?:\s+\p{L}[\p{L}\p{N}_-]*)*/gu, run=>
+  // beskrivning: namnet mellan kundnumret och fakturanumret -> kundetiketten
+  // ("Slutbetalning från 10001 <namn> 2993" -> "Slutbetalning från 10001 Kund 10001 2993");
+  // annars ord som inte är kända ord eller siffror -> kundetiketten
+  const nameAfterKundNr = new RegExp(`^(.*?(?<!\\d)${kundNr}\\s+)(.*?)(\\s+\\d+)?\\s*$`, 'u');
+  const desc = s=>{
+    const m = (s || '').match(nameAfterKundNr);
+    return m && /\p{L}/u.test(m[2]) ? m[1] + kundLabel + (m[3] || '') : vocabDesc(s);
+  };
+  const vocabDesc = s=>(s || '').replace(/\p{L}[\p{L}\p{N}_-]*(?:\s+\p{L}[\p{L}\p{N}_-]*)*/gu, run=>
     run.split(/(\s+)/).map(w=>/^\s*$/.test(w) || ANON_DESC_VOCAB.has(w.toLowerCase()) ? w : '\0').join('')
       .replace(/\0(?:\s+\0)*/g, kundLabel));
   const out = {
