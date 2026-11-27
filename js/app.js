@@ -877,6 +877,7 @@ document.getElementById('run-match').addEventListener('click', runMatch);
 
 // fyll i av runMatch: kund+faktureringsmånader med kundfakturor men helt utan underlag
 let lastMissingUnderlag = [];
+let lastKundDebug = new Map(); // kundNr -> beräknade värden för felsökningsexporten
 function runMatch(){
   lastMissingUnderlag = [];
   state.invoiceOffset = parseInt(document.getElementById('invoice-offset').value, 10) || 0;
@@ -924,6 +925,7 @@ function runMatch(){
     return !!findExclusionForRow({namn, manad: serviceMk});
   });
   const unmapped = [];
+  const underlagDebugByKund = new Map(); // kund -> underlagsrader som räknats in (för felsökningsexport)
   rows.forEach(r=>{
     const entries = (getMappingEntries(r.namn) || []).filter(e=>e.kundNr);
     if(entries.length===0){ unmapped.push(r); return; }
@@ -934,6 +936,10 @@ function runMatch(){
       if(!underlagByKund.has(entry.kundNr)) underlagByKund.set(entry.kundNr, new Map());
       const monthMap = underlagByKund.get(entry.kundNr);
       monthMap.set(mk, (monthMap.get(mk)||0) + share);
+      if(!underlagDebugByKund.has(entry.kundNr)) underlagDebugByKund.set(entry.kundNr, []);
+      underlagDebugByKund.get(entry.kundNr).push({namn: r.namn, avserManad: serviceMk, faktureringsmanad: mk,
+        avgift: r.avgift, procent: Number(entry.percent)||0, belopp: share,
+        kalla: String(r.id||'').startsWith('manual-') ? 'manuell rad' : 'underlagsfil'});
     });
   });
 
@@ -987,6 +993,7 @@ function runMatch(){
   });
 
   const identities = ledgerIdentities();
+  lastKundDebug = new Map();
   let html = '';
 
   const allKunder = new Set([...underlagByKund.keys(), ...ledgerByKund.keys()]);
@@ -1079,6 +1086,7 @@ function runMatch(){
     let monthRowsHtml = '';
     // löpande summor räknas över ALLA månader, även de som döljs av "Dölj månader som stämmer"
     let runDiffUF = 0, runSaldo = 0;
+    const monthDebug = [];
 
     // pass 1: siffror per månad
     const monthData = [...allMonths].sort().map(mk=>{
@@ -1129,6 +1137,10 @@ function runMatch(){
       const statusBetalning = monthFakturanr.length===0 ? '' : settleStatusTag(monthBelopp, monthSettled);
       runDiffUF += diffUF;
       runSaldo += led.debet - monthSettled; // fakturerat − reglerat; slutar på Utestående
+      monthDebug.push({faktureringsmanad: mk, fakturanr: monthFakturanr, underlag: underlagSum, fakturerat: led.debet,
+        kreditRader: led.kredit, diffUF, lopandeDiffUF: runDiffUF,
+        statusUF: approved ? 'Godkänd' : (okUF ? 'Stämmer' : (shifted ? 'Förskjuten' : 'Avviker')),
+        reglerat: monthSettled, lopandeSaldo: runSaldo, statusBetalning: stripTags(statusBetalning)});
 
       if(filterHideOkMonths && (okUF || approved)){ hiddenOkMonths++; return; }
 
@@ -1241,6 +1253,7 @@ function runMatch(){
     const ingaendeSaldo = rawRowsForKund.reduce((s,t)=>
       (!state.excludedReskontraRows[t.id] && outOfPeriod(t)==='before') ? s + t.debet - t.kredit : s, 0);
     let slutsaldo = ingaendeSaldo;
+    const txDebug = [];
     if(rawRowsForKund.length){
       let txHtml = startReskontraKey
         ? `<tr class="group-head"><td colspan="8">Ingående saldo ${esc(startReskontraKey)} <span class="small">(rader före startdatum)</span></td><td class="num saldo">${fmtNum(ingaendeSaldo)}</td><td colspan="2"></td></tr>`
@@ -1254,6 +1267,12 @@ function runMatch(){
           const saldoCell = inScope ? fmtNum(slutsaldo) : '—';
           const nat = naturalMonth(t);
           const ov = state.rowMonthOverrides[t.id] || '';
+          txDebug.push({vernr: t.vernr, datum: t.datum, fakturadatum: t.fakturadatum || '', forfallodatum: t.forfallodatum || '',
+            typ: t.typ, beskrivning: t.beskrivning, debet: t.debet, kredit: t.kredit,
+            kvittningsBelopp: t.kvittningsBelopp, fakturanr: t.fakturanr || '', kopplatFakturanr: state.paymentOverrides[t.id] || '',
+            naturligManad: nat, flyttadTill: ov, utesluten: excluded,
+            utanforPeriod: oop==='before' ? 'före startdatum' : (oop==='prePeriodInvoice' ? 'betalar faktura före startdatum' : ''),
+            saldo: inScope ? slutsaldo : null, anmarkning: t.note || ''});
           const notes = [
             ov ? `<span class="tag shift">Flyttad från ${esc(nat)}</span>` : '',
             t.note ? `<span class="tag cross">${esc(t.note)}</span>` : '',
@@ -1299,10 +1318,33 @@ function runMatch(){
     const saldoBadge = saldoMismatch
       ? `<span class="tag warn" title="Slutsaldo i reskontran (inkl. ingående saldo) skiljer sig från Utestående i perioden. Vanliga orsaker: en faktura från före startdatum som fortfarande är (delvis) obetald, eller inbetalningar som inte är kopplade till en faktura — se Alla transaktioner / Ej matchade betalningar.">Saldo ${fmtNum(slutsaldo)} ≠ utestående ${fmtNum(utestaende)}</span>`
       : '';
+    lastKundDebug.set(kundNr, {
+      kundNr, kundNamn,
+      installningar: {invoiceOffset: state.invoiceOffset, startUnderlag: state.startUnderlag, startReskontra: state.startReskontra, idag},
+      sammanfattning: {underlag: custTotalUnderlag, fakturerat: custTotalDebet, diffUF: totalDiffUF, avvikelse: hasDeviation,
+        avvikelseSumma: deviationSum, forskjutnaManader: shiftedCount, reglerat: custTotalReglerat, utestaende, ejForfallet, forfallet,
+        ingaendeSaldo, slutsaldo, saldoAvviker: saldoMismatch},
+      mappadeNamn: (namesByKundNr.get(kundNr) || []).map(n=>({namn: n, mappning: getMappingEntries(n),
+        ejFakturering: getExclusionPeriods(n).map(p=>({from: p.from, to: p.to}))})),
+      underlag: (underlagDebugByKund.get(kundNr) || []).sort((a,b)=>a.faktureringsmanad.localeCompare(b.faktureringsmanad)),
+      uteslutetUnderlag: excludedRows.filter(r=>(namesByKundNr.get(kundNr) || []).includes(r.namn))
+        .map(r=>({namn: r.namn, avserManad: monthKeyFromUnderlag(r.manad), avgift: r.avgift, periodFrom: r.periodFrom, periodTo: r.periodTo})),
+      manader: monthDebug,
+      fakturor: [...invoices.entries()].map(([nr, inv])=>{
+        const pay = paymentsByInvoice.get(nr) || {paid:0, lastDatum:''};
+        const settled = settledFor(nr, inv);
+        return {fakturanr: nr, fakturadatum: inv.datum, manad: inv.mk, forfallodatum: inv.forfallodatum, belopp: inv.belopp, rader: inv.rader,
+          betalt: pay.paid, senasteBetalning: pay.lastDatum, krediterat: creditAppliedByInvoice.get(nr) || 0,
+          kreditForbrukad: creditConsumed.get(nr) || 0, reglerat: settled, rest: inv.belopp - settled,
+          status: stripTags(settleStatusTag(inv.belopp, settled))};
+      }).sort((a,b)=>a.fakturadatum.localeCompare(b.fakturadatum)),
+      ejMatchadeBetalningar: unmatchedPayments.map(({t, reason})=>({vernr: t.vernr, datum: t.datum, beskrivning: t.beskrivning, belopp: t.kredit, orsak: reason})),
+      transaktioner: txDebug,
+    });
     const openAttr = (hasDeviation || (hasOutstanding && !onlyNotDue) || saldoMismatch) ? ' open' : '';
     html += `<details class="excl-group kund-group"${openAttr}><summary>
         <span class="excl-namn">Kund ${esc(kundNr)} — ${esc(kundNamn)}</span>
-        <span class="kund-badges">${ufBadge}${utBadge}${saldoBadge}</span>
+        <span class="kund-badges">${ufBadge}${utBadge}${saldoBadge}<button type="button" class="ghost small-btn export-kund" data-kund="${esc(kundNr)}" title="Laddar ner avstämningen för kunden (underlag, månader, fakturor, transaktioner med flaggor) som JSON för felsökning. Utan personuppgifter: namn ersätts med Kund/Person-etiketter.">Exportera (felsökning)</button></span>
       </summary><div style="padding:0 6px 10px;">${custHtml}</div></details>`;
   });
 
@@ -1389,6 +1431,12 @@ function runMatch(){
       runMatch();
     });
   });
+  reportEl.querySelectorAll('.export-kund').forEach(btn=>{
+    btn.addEventListener('click', e=>{
+      e.preventDefault(); e.stopPropagation(); // klick i <summary> ska inte fälla ut/ihop gruppen
+      exportKundDebug(btn.dataset.kund);
+    });
+  });
   reportEl.querySelectorAll('.row-exclude').forEach(chk=>{
     chk.addEventListener('change', ()=>{
       if(chk.checked) state.excludedReskontraRows[chk.dataset.id] = true;
@@ -1396,6 +1444,45 @@ function runMatch(){
       runMatch();
     });
   });
+}
+
+// ---------- felsökningsexport per kund ----------
+// Exporterar det avstämningen räknat fram för en kund (underlag, månader, fakturor, ej matchade
+// betalningar, transaktioner med flaggor) som JSON för felsökning — inte importerbar. Inga
+// personuppgifter: kundnamnet blir "Kund 10001", mappade namn "Person 1, 2...", och i beskrivningar
+// står bara kända ord och siffror kvar. Mottagare, födelseår och fritexter tas inte med.
+const stripTags = h=>String(h || '').replace(/<[^>]+>/g, '').trim();
+const ANON_DESC_VOCAB = new Set(['kundfaktura','kreditfaktura','inbetalning','till','från','faktura','fakturanr',
+  'betalning','kvittning','avgift','ränta','dröjsmålsränta','påminnelse','påminnelseavgift','ocr','nr','bg','pg',
+  'bankgiro','plusgiro','swish','autogiro','återbetalning','utbetalning','korrigering','kredit','debet','omföring',
+  'sek','kr','och','av','för','avser','ref']);
+
+function exportKundDebug(kundNr){
+  const d = lastKundDebug.get(kundNr);
+  if(!d){ alert('Kör avstämningen först.'); return; }
+  const kundLabel = `Kund ${kundNr}`;
+  const label = new Map(d.mappadeNamn.map((m, i)=>[m.namn, `Person ${i+1}`]));
+  const person = n=>label.get(n) || 'Person ?';
+  // beskrivning: ord som inte är kända ord eller siffror -> kundetiketten ("Kundfaktura till 10001 Kund 10001 2993")
+  const desc = s=>(s || '').replace(/\p{L}[\p{L}\p{N}_-]*(?:\s+\p{L}[\p{L}\p{N}_-]*)*/gu, run=>
+    run.split(/(\s+)/).map(w=>/^\s*$/.test(w) || ANON_DESC_VOCAB.has(w.toLowerCase()) ? w : '\0').join('')
+      .replace(/\0(?:\s+\0)*/g, kundLabel));
+  const out = {
+    ...d,
+    kundNamn: kundLabel,
+    exporterad: new Date().toISOString(),
+    mappadeNamn: d.mappadeNamn.map(m=>({...m, namn: person(m.namn)})),
+    underlag: d.underlag.map(r=>({...r, namn: person(r.namn)})),
+    uteslutetUnderlag: d.uteslutetUnderlag.map(r=>({...r, namn: person(r.namn)})),
+    ejMatchadeBetalningar: d.ejMatchadeBetalningar.map(r=>({...r, beskrivning: desc(r.beskrivning)})),
+    transaktioner: d.transaktioner.map(t=>({...t, beskrivning: desc(t.beskrivning), anmarkning: desc(t.anmarkning)})),
+  };
+  const blob = new Blob([JSON.stringify(out, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `kund-${kundNr}-felsokning.json`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
 }
 
 // ---------- export / import state ----------
